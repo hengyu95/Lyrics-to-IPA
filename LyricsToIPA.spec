@@ -13,11 +13,11 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    hiddenimports=['svgwrite'],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
@@ -42,14 +42,3 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-
-import sys
-
-# If PyInstaller is running on a Mac, build the .app bundle!
-if sys.platform == 'darwin':
-    app = BUNDLE(
-        exe,
-        name='LyricsToIPA.app',
-        icon=None,
-        bundle_identifier=None,
-    )

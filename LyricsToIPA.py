@@ -403,27 +403,50 @@ def brightness_color(b: float) -> QColor:
 
 
 
-def _tts_speak(word: str) -> None:
-    """Speak *word* via the system TTS, non-blocking.
-    Uses PowerShell SAPI on Windows, say on macOS, espeak on Linux.
-    Silently does nothing if TTS is unavailable.
+def _tts_speak(word: str, ipa_pron: str = '') -> None:
+    """Speak *word* via system TTS, using *ipa_pron* where the platform
+    supports IPA phoneme input (Windows SAPI SSML).
+    Non-blocking. Silently does nothing if TTS is unavailable.
     """
     try:
         if sys.platform == 'win32':
-            safe = word.replace('"', '').replace("'", '')
+            safe_word = word.replace('"', '').replace("'", '').replace('<', '').replace('>', '')
+            if ipa_pron:
+                # Strip IPA stress/length marks that SAPI doesn't handle well
+                safe_ipa = ipa_pron.replace('"', '').replace("'", '').replace('<', '').replace('>', '')
+                ssml = (
+                    '<speak version="1.0" '
+                    'xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">'
+                    f'<phoneme alphabet="ipa" ph="{safe_ipa}">{safe_word}</phoneme>'
+                    '</speak>'
+                )
+                ps_cmd = (
+                    'Add-Type -AssemblyName System.Speech; '
+                    '$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; '
+                    f'$s.SpeakSsml(\'{ssml.replace(chr(39), "")}\''
+                    ')'
+                )
+            else:
+                ps_cmd = (
+                    'Add-Type -AssemblyName System.Speech; '
+                    f'(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("{safe_word}")'
+                )
             subprocess.Popen(
-                ['powershell', '-WindowStyle', 'Hidden', '-Command',
-                 f'Add-Type -AssemblyName System.Speech; '
-                 f'(New-Object System.Speech.Synthesis.SpeechSynthesizer)'
-                 f'.Speak("{safe}")'],
-                creationflags=0x08000000,  # CREATE_NO_WINDOW
+                ['powershell', '-WindowStyle', 'Hidden', '-Command', ps_cmd],
+                creationflags=0x08000000,
             )
         elif sys.platform == 'darwin':
+            # macOS `say` does not support IPA; speak the word as-is
             subprocess.Popen(['say', word])
         else:
-            subprocess.Popen(['espeak', '-v', 'en', word])
+            # Linux: espeak-ng can speak the word; IPA input not reliable cross-version
+            subprocess.Popen(['espeak-ng', '-v', 'en', word])
     except (OSError, FileNotFoundError):
-        pass
+        try:
+            # Fallback: plain espeak
+            subprocess.Popen(['espeak', '-v', 'en', word])
+        except (OSError, FileNotFoundError):
+            pass
 
 
 @dataclass
@@ -538,6 +561,12 @@ def consonant_release_tip(consonants: list) -> str:
 
 # R-colored consonant (trailing)
 IPA_RHOTIC = {'ɹ', 'r'}
+
+# Unvoiced consonants (vocal cords open → air dump)
+IPA_UNVOICED = {'p', 't', 'k', 'f', 's', 'ʃ', 'h', 'θ', 'tʃ'}
+
+# Sibilants (mic-hostile)
+IPA_SIBILANT = {'s', 'z', 'ʃ', 'ʒ', 'tʃ', 'dʒ'}
 
 # Vowel-glide routing: which semi-vowel to insert before next vowel
 _GLIDE_J = {'i','ɪ','e','ɛ','æ','eɪ','aɪ','ɔɪ','ɪə','eə'}
@@ -1870,26 +1899,45 @@ class AnalysisPanel(QWidget):
             self.vowel_selected.emit(index)
 
     def _update_word_tips(self, pron: str):
-        """Refresh legato tip (feature 1) and consonant-release tip (feature 2)."""
-        trailing = ipa_trailing_consonants(pron)
+        """Refresh the panel tips using the same priority logic as inline annotations,
+        so the text in the panel matches the hover tooltip on the word.
+        """
+        trailing  = ipa_trailing_consonants(pron)
+        end_vowel = ipa_ends_with_vowel(pron)
+        next_ipa  = self._next_ipa
 
-        # Consonant release tip
-        ctip = consonant_release_tip(trailing)
-        self.consonant_tip.setText(ctip)
-        self.consonant_tip.setVisible(bool(ctip))
+        next_leading_v = ipa_leading_vowel(next_ipa) if next_ipa else None
+        next_leading_c = ipa_leading_consonant(next_ipa) if next_ipa else None
+        rhotics   = [c for c in trailing if c in IPA_RHOTIC]
+        has_rhotic_vowel = any(s in ('ɚ', 'ɝ') for s, _, _ in find_syllable_vowels(pron))
 
-        # Legato linking tip
-        if trailing and self._next_ipa:
-            leading = ipa_leading_vowel(self._next_ipa)
-            if leading is not None:
-                cons_display = ' '.join(f'/{c}/' for c in trailing)
-                self.legato_tip.setText(
-                    f"\u2197 Legato link \u2014 move {cons_display} to open the next "
-                    f"word\u2019s /{leading}/. Keep the breath connected; "
-                    f"don\u2019t lift between the words.")
-                self.legato_tip.setVisible(True)
-                return
-        self.legato_tip.setVisible(False)
+        legato_text = cons_text = ''
+
+        # Priority mirrors _compute_annotations exactly
+        if trailing and next_leading_v is not None:
+            cd = ' '.join(f'/{c}/' for c in trailing)
+            legato_text = (f'\u2197 Legato \u2014 carry {cd} into /{next_leading_v}/ '
+                           f'of the next word. Keep the breath connected.')
+        elif end_vowel is not None and next_leading_v is not None:
+            glide = '/j/' if end_vowel in _GLIDE_J else '/w/'
+            legato_text = (f'Vowel-to-vowel \u2014 insert {glide} to avoid '
+                           f'a glottal stop before /{next_leading_v}/. Keep airflow open.')
+        elif trailing and next_leading_c is not None:
+            crash = consonant_crash_tip(trailing, next_leading_c)
+            if crash:
+                legato_text = crash
+
+        # Consonant / rhotic tip (secondary)
+        if rhotics or has_rhotic_vowel:
+            cons_text = ('American R \u2014 de-rhotacize: release the tongue curl/bunch. '
+                         'Sustain on \u0259 or \u025c instead.')
+        elif trailing:
+            cons_text = consonant_release_tip(trailing)
+
+        self.legato_tip.setText(legato_text)
+        self.legato_tip.setVisible(bool(legato_text))
+        self.consonant_tip.setText(cons_text)
+        self.consonant_tip.setVisible(bool(cons_text))
 
     def _update_stress_warning(self, vowel_idx):
         """Refresh stress warning (feature 3) for the currently selected vowel."""
@@ -1930,8 +1978,13 @@ class AnalysisPanel(QWidget):
                 item.widget().deleteLater()
 
     def _on_speak(self):
-        if self._current_word and self._current_word != 'Click a word to begin':
-            _tts_speak(self._current_word)
+        if not self._current_word or self._current_word == 'Click a word to begin':
+            return
+        # Use the currently selected pronunciation so Valjean etc. are correct
+        ipa_pron = ''
+        if self._pronunciations and self._current_pron_index < len(self._pronunciations):
+            ipa_pron = self._pronunciations[self._current_pron_index]
+        _tts_speak(self._current_word, ipa_pron)
 
     def _on_play(self):
         if self._current_vowel:
@@ -2118,7 +2171,7 @@ class MainWindow(QMainWindow):
         self._editor_font_size = 16
         self._ui_font_scale = 1.0
         self._annotations_enabled = True
-        self._enabled_hint_types = {'legato','vowel_glide','crash','r_toxicity','plosive','nasal','approx','fricative'}
+        self._enabled_hint_types = {'legato','vowel_glide','crash','r_toxicity','dark_l','glottal','plosive','nasal','approx','fricative'}
         self._word_annotations = []
         self._annotation_timer = QTimer(self)
         self._annotation_timer.setSingleShot(True)
@@ -2162,11 +2215,9 @@ class MainWindow(QMainWindow):
         lyrics_title.setObjectName('PanelTitle')
         self.hints_btn = QToolButton()
         self.hints_btn.setObjectName('HintsToggle')
-        self.hints_btn.setCheckable(True)
-        self.hints_btn.setChecked(True)
         self.hints_btn.setFixedHeight(_scale(22))
-        self.hints_btn.setPopupMode(QToolButton.MenuButtonPopup)
-        self.hints_btn.toggled.connect(self._on_hints_toggled)
+        self.hints_btn.setPopupMode(QToolButton.InstantPopup)
+        self.hints_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self._hints_menu = self._build_hints_menu()
         self.hints_btn.setMenu(self._hints_menu)
         self._update_hints_btn_label()
@@ -2197,6 +2248,16 @@ class MainWindow(QMainWindow):
         self.chiaroscuro_label.setWordWrap(True)
         self.chiaroscuro_label.setVisible(False)
         ec_layout.addWidget(self.chiaroscuro_label)
+        self.breath_label = QLabel('')
+        self.breath_label.setObjectName('ChiaroscuroTip')
+        self.breath_label.setWordWrap(True)
+        self.breath_label.setVisible(False)
+        ec_layout.addWidget(self.breath_label)
+        self.sibilance_label = QLabel('')
+        self.sibilance_label.setObjectName('ChiaroscuroTip')
+        self.sibilance_label.setWordWrap(True)
+        self.sibilance_label.setVisible(False)
+        ec_layout.addWidget(self.sibilance_label)
 
         self.analysis = AnalysisPanel()
         self.analysis.play_requested.connect(self._play_vowel)
@@ -2428,6 +2489,8 @@ class MainWindow(QMainWindow):
         'vowel_glide': 'Vowel glides (anti-glottal)',
         'crash':       'Consonant crashes',
         'r_toxicity':  'R toxicity',
+        'dark_l':      'Dark L trap',
+        'glottal':     'Phrase-initial glottal',
         'plosive':     'Plosive exits',
         'nasal':       'Nasal exits',
         'approx':      'Approximant exits',
@@ -2436,11 +2499,18 @@ class MainWindow(QMainWindow):
 
     def _build_hints_menu(self) -> QMenu:
         menu = QMenu(self)
-        # "All on" / "All off" convenience actions
-        a_all = QAction('Enable all', menu)
+        # Master on/off toggle at the top
+        self._act_hints_enabled = QAction('Hints enabled', menu)
+        self._act_hints_enabled.setCheckable(True)
+        self._act_hints_enabled.setChecked(True)
+        self._act_hints_enabled.triggered.connect(self._on_hints_toggled)
+        menu.addAction(self._act_hints_enabled)
+        menu.addSeparator()
+        # Convenience bulk actions
+        a_all = QAction('Enable all types', menu)
         a_all.triggered.connect(lambda: self._set_all_hint_types(True))
         menu.addAction(a_all)
-        a_none = QAction('Disable all', menu)
+        a_none = QAction('Disable all types', menu)
         a_none.triggered.connect(lambda: self._set_all_hint_types(False))
         menu.addAction(a_none)
         menu.addSeparator()
@@ -2486,6 +2556,9 @@ class MainWindow(QMainWindow):
 
     def _on_hints_toggled(self, checked: bool):
         self._annotations_enabled = checked
+        # Keep the menu action checkmark in sync
+        if hasattr(self, '_act_hints_enabled'):
+            self._act_hints_enabled.setChecked(checked)
         self._update_hints_btn_label()
         if checked:
             self._compute_annotations()
@@ -2521,6 +2594,31 @@ class MainWindow(QMainWindow):
                 word_l = word.lower()
                 if word_l in dismissed:
                     continue
+
+                # ── glottal onset check (this word opens a phrase) ────────
+                # True if word is first on the line, or preceded by punctuation
+                phrase_opener = (i == 0)
+                if not phrase_opener and i > 0:
+                    before = line_text[matches[i-1].end():m.start()]
+                    phrase_opener = bool(re.search(r'[,;:.!?]', before))
+                if phrase_opener and 'glottal' in self._enabled_hint_types:
+                    # Only flag if the word starts with a vowel
+                    prons_check = self._cached_pronunciations(word)
+                    preferred_c = self._pron_index_cache.get(word_l, 0)
+                    pron_check = prons_check[min(preferred_c, len(prons_check)-1)] if prons_check else ''
+                    if pron_check and ipa_leading_vowel(pron_check) is not None and word_l not in dismissed:
+                        annotations.append(WordAnnotation(
+                            word=word, word_lower=word_l,
+                            block=block_num, start=m.start(), end=m.end(),
+                            abs_start=block.position() + m.start(),
+                            abs_end=block.position() + m.end(),
+                            tip_type='glottal',
+                            tip_text=('Phrase-initial glottal \u2014 this phrase opens on a vowel. '
+                                      'Use a clean balanced onset: let the breath flow a split-second '
+                                      'before the tone. Avoid a glottal strike (colpo di glottide).'),
+                            color=ANN_COLOR['glottal'],
+                            bg_color=ANN_BG['glottal'],
+                        ))
 
                 # ── next-word context ─────────────────────────────────────
                 next_ipa = None
@@ -2584,7 +2682,14 @@ class MainWindow(QMainWindow):
                            '(ə or ɜ) instead of the r-colored form.')
                     tip_type = 'r_toxicity'
 
-                # 5. Consonant exit tips (no boundary interaction found above)
+                # 5. Dark L — trailing /l/ not already captured as legato/crash
+                if tip_type is None and trailing and trailing[-1] == 'l':
+                    tip = ('Dark L exit \u2014 keep the tongue tip on the alveolar '
+                           'ridge. Do not pull the tongue root back; that '
+                           'swallows the resonance and darkens the sound.')
+                    tip_type = 'dark_l'
+
+                # 6. Consonant exit tips (no boundary interaction found above)
                 if tip_type is None:
                     if plosives:
                         s = ' '.join(f'/{c}/' for c in plosives)
@@ -2666,6 +2771,54 @@ class MainWindow(QMainWindow):
         self._current_clicked_word_idx = clicked_word_idx
         self.trajectory.set_phrase(items)
         self._update_chiaroscuro(items)
+        self._update_breath_and_sibilance(line_text)
+
+    def _update_breath_and_sibilance(self, line_text: str):
+        """Scan the raw line IPA for unvoiced density and sibilant clusters."""
+        matches = list(WORD_RE.finditer(line_text))
+        all_phones = []
+        for m in matches:
+            prons = self._cached_pronunciations(m.group())
+            if prons:
+                preferred = self._pron_index_cache.get(m.group().lower(), 0)
+                pron = prons[min(preferred, len(prons) - 1)]
+                # Collect all consonant tokens from this pron
+                for ch in pron:
+                    if ch in IPA_ALL_CONS:
+                        all_phones.append(ch)
+                # Also check digraphs
+                for digraph in ('tʃ', 'dʒ'):
+                    if digraph in pron:
+                        all_phones.append(digraph)
+
+        # Breath leak
+        if all_phones:
+            unvoiced = sum(1 for p in all_phones if p in IPA_UNVOICED)
+            ratio = unvoiced / len(all_phones)
+            if ratio >= 0.55:
+                self.breath_label.setText(
+                    f'\u2697 High unvoiced consonant density ({ratio:.0%}) \u2014 '
+                    f'these open the glottis and dump air. '
+                    f'Pace your support actively; engage the intercostals '
+                    f'to maintain sub-glottal pressure throughout.')
+                self.breath_label.setVisible(True)
+            else:
+                self.breath_label.setVisible(False)
+        else:
+            self.breath_label.setVisible(False)
+
+        # Sibilance
+        sibilants = [p for p in all_phones if p in IPA_SIBILANT]
+        if len(sibilants) >= 3:
+            self.sibilance_label.setText(
+                f'\u26a0 Sibilant-heavy phrase ({len(sibilants)} sibilants) \u2014 '
+                f'on mic: soften and shorten each hiss; de-emphasize the '
+                f'tongue-tip contact to reduce piercing highs. '
+                f'In the hall: use them to cut through, but keep them forward '
+                f'and rhythmically precise.')
+            self.sibilance_label.setVisible(True)
+        else:
+            self.sibilance_label.setVisible(False)
 
     def _update_chiaroscuro(self, items):
         """Show a brightness-balance warning for the current phrase."""
