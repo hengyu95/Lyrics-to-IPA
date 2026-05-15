@@ -5,7 +5,6 @@ on:
     tags:
       - 'v*' 
 
-# ADD THIS BLOCK RIGHT HERE
 permissions:
   contents: write
 
@@ -14,8 +13,6 @@ jobs:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     
-    # This matrix tells GitHub to run this exact process twice: 
-    # Once on a Windows machine, once on a Mac machine.
     strategy:
       matrix:
         os: [windows-latest, macos-latest]
@@ -27,29 +24,25 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.10' # Change this to match your Python version
+        python-version: '3.10'
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller PyQt5 eng_to_ipa
-        # Add any other pip installs your app needs here
+        pip install pyinstaller PyQt5 eng_to_ipa svgwrite
 
     - name: Build with PyInstaller
-      # This uses the .spec file you generated earlier
       run: pyinstaller LyricsToIPA.spec
 
     - name: Zip Mac App
-    # This step only runs on the Mac computer. It zips the .app folder into a single file.
       if: matrix.os == 'macos-latest'
       run: |
-          cd dist
-          zip -r LyricsToIPA-Mac.zip LyricsToIPA.app
+        cd dist
+        zip -r LyricsToIPA-Mac.zip LyricsToIPA.app
 
     - name: Upload to GitHub Releases
       uses: softprops/action-gh-release@v1
       with:
-        # Grabs the exe, the raw mac file, and the new Mac zip
         files: |
           dist/*.exe
           dist/LyricsToIPA
