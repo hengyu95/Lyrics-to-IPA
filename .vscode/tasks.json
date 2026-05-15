@@ -1,0 +1,27 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build LyricsToIPA",
+            "type": "shell",
+            "command": "pyinstaller",
+			"args": [
+                "--onefile",
+                "--windowed",
+                "--collect-data", "eng_to_ipa",
+                "--collect-submodules", "PyQt5.QtMultimedia",
+                "--add-data", "Audio:Audio", 
+                "LyricsToIPA.py"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

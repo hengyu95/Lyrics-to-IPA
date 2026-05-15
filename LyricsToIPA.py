@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from io import StringIO
@@ -36,9 +37,9 @@ from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtWidgets import (QAction, QApplication, QComboBox, QDialog,
                              QDialogButtonBox, QFrame, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QMainWindow,
-                             QMessageBox, QPlainTextEdit, QPushButton,
+                             QMenu, QMessageBox, QPlainTextEdit, QPushButton,
                              QScrollArea, QSizePolicy, QSplitter, QTextEdit,
-                             QToolTip, QVBoxLayout, QWidget)
+                             QToolButton, QToolTip, QVBoxLayout, QWidget)
 import svgwrite
 import eng_to_ipa as ipa
 
@@ -399,6 +400,30 @@ def brightness_color(b: float) -> QColor:
         bb = int(168 + (120 - 168) * t)
     return QColor(r, g, bb)
 
+
+
+
+def _tts_speak(word: str) -> None:
+    """Speak *word* via the system TTS, non-blocking.
+    Uses PowerShell SAPI on Windows, say on macOS, espeak on Linux.
+    Silently does nothing if TTS is unavailable.
+    """
+    try:
+        if sys.platform == 'win32':
+            safe = word.replace('"', '').replace("'", '')
+            subprocess.Popen(
+                ['powershell', '-WindowStyle', 'Hidden', '-Command',
+                 f'Add-Type -AssemblyName System.Speech; '
+                 f'(New-Object System.Speech.Synthesis.SpeechSynthesizer)'
+                 f'.Speak("{safe}")'],
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['say', word])
+        else:
+            subprocess.Popen(['espeak', '-v', 'en', word])
+    except (OSError, FileNotFoundError):
+        pass
 
 
 @dataclass
@@ -1098,7 +1123,7 @@ QLabel#ChiaroscuroTip {{
     padding-top: {px(2)};
 }}
 
-QPushButton#HintsToggle {{
+QPushButton#HintsToggle, QToolButton#HintsToggle {{
     background-color: #1c2230;
     border: {px(1)} solid #3a4258;
     border-radius: {px(4)};
@@ -1108,8 +1133,8 @@ QPushButton#HintsToggle {{
     font-weight: bold;
     letter-spacing: {px(1)};
 }}
-QPushButton#HintsToggle:hover {{ border-color: #c8a060; color: #c8a060; }}
-QPushButton#HintsToggle:checked {{
+QPushButton#HintsToggle:hover, QToolButton#HintsToggle:hover {{ border-color: #c8a060; color: #c8a060; }}
+QPushButton#HintsToggle:checked, QToolButton#HintsToggle:checked {{
     background-color: #201a0a;
     border-color: #c8a060;
     color: #c8a060;
@@ -1654,8 +1679,18 @@ class AnalysisPanel(QWidget):
         self._current_syllables = []
         self._next_ipa = None
 
+        word_header = QWidget()
+        wh_layout = QHBoxLayout(word_header)
+        wh_layout.setContentsMargins(0, 0, 0, 0)
+        wh_layout.setSpacing(_scale(8))
         self.word_label = QLabel('Click a word to begin')
         self.word_label.setObjectName('WordLabel')
+        self.speak_btn = QPushButton('▶ Speak')
+        self.speak_btn.setFixedHeight(_scale(28))
+        self.speak_btn.setEnabled(False)
+        self.speak_btn.clicked.connect(self._on_speak)
+        wh_layout.addWidget(self.word_label, 1)
+        wh_layout.addWidget(self.speak_btn)
 
         self.ipa_label = QLabel('')
         self.ipa_label.setObjectName('IpaLabel')
@@ -1701,7 +1736,7 @@ class AnalysisPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(_scale(20), _scale(20), _scale(20), _scale(20))
         layout.setSpacing(_scale(10))
-        layout.addWidget(self.word_label)
+        layout.addWidget(word_header)
         layout.addWidget(self.ipa_label)
         layout.addWidget(self.legato_tip)
         layout.addWidget(self.consonant_tip)
@@ -1721,6 +1756,7 @@ class AnalysisPanel(QWidget):
         self._current_word = word
         self._next_ipa = next_ipa
         self.word_label.setText(word)
+        self.speak_btn.setEnabled(bool(word and word != 'Click a word to begin'))
 
         if not pronunciations:
             self.ipa_label.setText(
@@ -1732,6 +1768,7 @@ class AnalysisPanel(QWidget):
             self.chart.show_vowel(None)
             self.card.show_phone(None)
             self.play_btn.setEnabled(False)
+            self.speak_btn.setEnabled(False)
             self.legato_tip.setVisible(False)
             self.consonant_tip.setVisible(False)
             return
@@ -1891,6 +1928,10 @@ class AnalysisPanel(QWidget):
             item = self.vowel_btn_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+
+    def _on_speak(self):
+        if self._current_word and self._current_word != 'Click a word to begin':
+            _tts_speak(self._current_word)
 
     def _on_play(self):
         if self._current_vowel:
@@ -2077,6 +2118,7 @@ class MainWindow(QMainWindow):
         self._editor_font_size = 16
         self._ui_font_scale = 1.0
         self._annotations_enabled = True
+        self._enabled_hint_types = {'legato','vowel_glide','crash','r_toxicity','plosive','nasal','approx','fricative'}
         self._word_annotations = []
         self._annotation_timer = QTimer(self)
         self._annotation_timer.setSingleShot(True)
@@ -2118,12 +2160,16 @@ class MainWindow(QMainWindow):
         lh_layout.setSpacing(_scale(8))
         lyrics_title = QLabel('LYRICS')
         lyrics_title.setObjectName('PanelTitle')
-        self.hints_btn = QPushButton('HINTS')
+        self.hints_btn = QToolButton()
         self.hints_btn.setObjectName('HintsToggle')
         self.hints_btn.setCheckable(True)
         self.hints_btn.setChecked(True)
         self.hints_btn.setFixedHeight(_scale(22))
+        self.hints_btn.setPopupMode(QToolButton.MenuButtonPopup)
         self.hints_btn.toggled.connect(self._on_hints_toggled)
+        self._hints_menu = self._build_hints_menu()
+        self.hints_btn.setMenu(self._hints_menu)
+        self._update_hints_btn_label()
         lh_layout.addWidget(lyrics_title)
         lh_layout.addStretch()
         lh_layout.addWidget(self.hints_btn)
@@ -2376,8 +2422,71 @@ class MainWindow(QMainWindow):
 
     # ---- Inline annotation hints ----
 
+    # Hint type labels for display
+    _HINT_TYPE_LABELS = {
+        'legato':      'Legato links',
+        'vowel_glide': 'Vowel glides (anti-glottal)',
+        'crash':       'Consonant crashes',
+        'r_toxicity':  'R toxicity',
+        'plosive':     'Plosive exits',
+        'nasal':       'Nasal exits',
+        'approx':      'Approximant exits',
+        'fricative':   'Fricative exits',
+    }
+
+    def _build_hints_menu(self) -> QMenu:
+        menu = QMenu(self)
+        # "All on" / "All off" convenience actions
+        a_all = QAction('Enable all', menu)
+        a_all.triggered.connect(lambda: self._set_all_hint_types(True))
+        menu.addAction(a_all)
+        a_none = QAction('Disable all', menu)
+        a_none.triggered.connect(lambda: self._set_all_hint_types(False))
+        menu.addAction(a_none)
+        menu.addSeparator()
+        # Per-type checkable actions
+        for tip_type, label in self._HINT_TYPE_LABELS.items():
+            act = QAction(label, menu)
+            act.setCheckable(True)
+            act.setChecked(tip_type in self._enabled_hint_types)
+            act.triggered.connect(
+                lambda checked, t=tip_type: self._on_hint_type_toggled(t, checked))
+            menu.addAction(act)
+        return menu
+
+    def _update_hints_btn_label(self):
+        n = len(self._enabled_hint_types)
+        total = len(self._HINT_TYPE_LABELS)
+        if not self._annotations_enabled:
+            self.hints_btn.setText('HINTS (off)')
+        elif n == total:
+            self.hints_btn.setText('HINTS')
+        else:
+            self.hints_btn.setText(f'HINTS ({n}/{total})')
+
+    def _set_all_hint_types(self, enabled: bool):
+        if enabled:
+            self._enabled_hint_types = set(self._HINT_TYPE_LABELS.keys())
+        else:
+            self._enabled_hint_types = set()
+        # Sync checkmarks in menu
+        for act in self._hints_menu.actions():
+            if act.isCheckable():
+                act.setChecked(enabled)
+        self._update_hints_btn_label()
+        self._compute_annotations()
+
+    def _on_hint_type_toggled(self, tip_type: str, checked: bool):
+        if checked:
+            self._enabled_hint_types.add(tip_type)
+        else:
+            self._enabled_hint_types.discard(tip_type)
+        self._update_hints_btn_label()
+        self._compute_annotations()
+
     def _on_hints_toggled(self, checked: bool):
         self._annotations_enabled = checked
+        self._update_hints_btn_label()
         if checked:
             self._compute_annotations()
         else:
@@ -2495,6 +2604,8 @@ class MainWindow(QMainWindow):
                         tip_type = 'fricative'
 
                 if tip_type is None:
+                    continue
+                if tip_type not in self._enabled_hint_types:
                     continue
 
                 annotations.append(WordAnnotation(
