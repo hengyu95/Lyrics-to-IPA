@@ -157,6 +157,6 @@ The **▶ Play vowel sound** button plays the selected vowel. R-colored vowels /
 
 | Platform | Path |
 |---|---|
-| Windows | `%LOCALAPPDATA%\Heng\LyricIPAFinder\songs.json` |
-| macOS | `~/Library/Application Support/Heng/LyricIPAFinder/songs.json` |
-| Linux | `~/.local/share/Heng/LyricIPAFinder/songs.json` |
+| Windows | `%LOCALAPPDATA%\LyricIPAFinder\songs.json` |
+| macOS | `~/Library/Application Support/LyricIPAFinder/songs.json` |
+| Linux | `~/.local/share/LyricIPAFinder/songs.json` |
