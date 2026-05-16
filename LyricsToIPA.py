@@ -32,7 +32,7 @@ os.environ.setdefault('QT_AUTO_SCREEN_SCALE_FACTOR', '1')
 
 from PyQt5.QtCore import (Qt, QUrl, QSettings, QStandardPaths, QTimer,
                           pyqtSignal)
-from PyQt5.QtGui import (QColor, QFont, QLinearGradient, QPainter, QPalette,
+from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPalette,
                          QTextCharFormat, QTextCursor)
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtWidgets import (QAction, QApplication, QComboBox, QDialog,
@@ -65,30 +65,23 @@ def _dpr() -> float:
 
 
 
-# Module-level UI scale — updated by MainWindow when the user changes the setting.
-# Defaults to 1/DPR so a 4K screen gets a reasonable size before settings load.
-_UI_SCALE: float = 1.0  # will be overwritten by MainWindow.__init__
-
-
-def _apply_ui_scale(scale: float) -> None:
-    """Update the module-level _UI_SCALE used by _scale() / _scalef()."""
-    global _UI_SCALE
-    _UI_SCALE = max(0.1, scale)
-
-
 def _scale(value: float) -> int:
-    """Scale a logical pixel value by the current UI scale factor.
+    """Return *value* as an integer logical-pixel size.
 
-    Called for hard-coded widget sizes (setMinimumSize, setFixedHeight, …)
-    outside the QSS stylesheet.  ``_UI_SCALE`` is set by MainWindow on startup
-    and whenever the user adjusts View → Adjust UI Scale.
+    With ``AA_EnableHighDpiScaling`` enabled, Qt automatically converts
+    logical pixels to physical pixels using the screen DPR, so callers
+    should pass the intended *logical* size and let Qt do the rest.
+    The user's UI-scale preference lives in the QSS stylesheet (build_style)
+    where it can be updated dynamically; hard-coded widget sizes set via
+    setFixedHeight/setMinimumSize do not respond to live style changes so
+    they stay at neutral logical-pixel values.
     """
-    return max(1, round(value * _UI_SCALE))
+    return max(1, round(value))
 
 
 def _scalef(value: float) -> float:
     """Floating-point version of _scale."""
-    return value * _UI_SCALE
+    return float(value)
 
 
 # =============================================================================
@@ -1120,19 +1113,23 @@ class SongStore:
 def build_style(dpr: float, ui_scale: float = 1.0) -> str:
     """Return the full QSS stylesheet.
 
-    *dpr* is the device pixel ratio and is used only for sub-pixel-aware
-    rounding so hairlines stay crisp on HiDPI screens.
-    *ui_scale* is the user-controlled overall scale factor (0.4–2.0).
-    All logical sizes — borders, padding, font sizes, radii — are multiplied
-    by *ui_scale* so the whole layout shrinks or grows uniformly.
+    *ui_scale* is the user-controlled scale factor (0.25–2.0).  All logical
+    sizes in the stylesheet — fonts, padding, borders, radii — are multiplied
+    by it, so the whole text/layout shrinks or grows together.
+
+    *dpr* is accepted for call-site compatibility but is not used inside the
+    function.  With ``AA_EnableHighDpiScaling`` enabled, Qt automatically
+    scales stylesheet logical-pixel values by the device pixel ratio, so
+    we must express sizes in logical pixels only and let Qt handle the rest.
+    Multiplying by DPR here would cause double-scaling on HiDPI screens.
     """
 
     def px(n: float) -> str:
-        """Structural size (border, padding, radius, min-width …)."""
+        """Structural size in logical pixels, scaled by the user's preference."""
         return f'{max(1, round(n * ui_scale))}px'
 
     def fs(n: float) -> str:
-        """Font size — same scale factor as layout."""
+        """Font size in logical pixels, scaled by the user's preference."""
         return f'{max(1, round(n * ui_scale))}px'
 
     return f"""
@@ -1582,8 +1579,21 @@ class BrightnessBar(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setFixedHeight(_scale(46))
         self._b = None
+        self._ui_scale = 1.0
+        self._refresh_height()
+
+    def _refresh_height(self):
+        """Recalculate fixed height from font metrics so labels are never clipped."""
+        f = QFont('Inter', round(9 * self._ui_scale))
+        fm = QFontMetrics(f)
+        h = _scale(4) + _scale(14) + _scale(4) + fm.height() + _scale(4)
+        self.setFixedHeight(max(_scale(36), h))
+
+    def setUiScale(self, scale: float):
+        self._ui_scale = scale
+        self._refresh_height()
+        self.update()
 
     def set_brightness(self, b):
         self._b = b
@@ -1607,14 +1617,19 @@ class BrightnessBar(QWidget):
         p.drawRoundedRect(bar_left, bar_top, bar_right - bar_left, bar_h,
                           _scale(7), _scale(7))
 
+        # Font: logical point size only — Qt's HiDPI machinery scales to physical
+        # pixels automatically. Never multiply by _dpr() here.
+        f = QFont('Inter', round(9 * self._ui_scale))
+        fm = QFontMetrics(f)
         p.setPen(QColor('#7888a0'))
-        f = QFont('Inter', round(9 * _dpr()))
         p.setFont(f)
         label_y = bar_top + bar_h + _scale(4)
-        label_h = _scale(18)
-        p.drawText(bar_left, label_y, _scale(60), label_h,
+        label_h = fm.height()
+        dark_w   = fm.horizontalAdvance('dark')   + _scale(6)
+        bright_w = fm.horizontalAdvance('bright') + _scale(6)
+        p.drawText(bar_left, label_y, dark_w, label_h,
                    Qt.AlignLeft | Qt.AlignTop, 'dark')
-        p.drawText(bar_right - _scale(60), label_y, _scale(60), label_h,
+        p.drawText(bar_right - bright_w, label_y, bright_w, label_h,
                    Qt.AlignRight | Qt.AlignTop, 'bright')
 
         if self._b is not None:
@@ -1830,13 +1845,27 @@ class PhraseTrajectoryBar(QWidget):
 
     def __init__(self):
         super().__init__()
-        h = _scale(72)
-        self.setMinimumHeight(h)
-        self.setMaximumHeight(h)
         self._items = []  # (vowel_symbol, word_index)
         self._highlight_index = -1
         self._cell_rects = []  # list of (x, w) per cell, built in paintEvent
+        self._ui_scale = 1.0
         self.setCursor(Qt.PointingHandCursor)
+        self._refresh_height()
+
+    def _refresh_height(self):
+        """Derive widget height from font metrics so vowel labels are never clipped."""
+        f_label = QFont('Charis SIL', round(12 * self._ui_scale))
+        fm = QFontMetrics(f_label)
+        label_strip_h = fm.height() + _scale(4)
+        total_h = _scale(10) + _scale(32) + label_strip_h + _scale(8)
+        h = max(_scale(60), total_h)
+        self.setMinimumHeight(h)
+        self.setMaximumHeight(h)
+
+    def setUiScale(self, scale: float):
+        self._ui_scale = scale
+        self._refresh_height()
+        self.update()
 
     def set_phrase(self, items):
         self._items = list(items)
@@ -1857,12 +1886,18 @@ class PhraseTrajectoryBar(QWidget):
 
         if not self._items:
             p.setPen(QColor('#4a5670'))
-            f = QFont('Inter', round(11 * _dpr()))
+            # Logical point size only — no _dpr() multiplication
+            f = QFont('Inter', round(11 * self._ui_scale))
             f.setItalic(True)
             p.setFont(f)
             p.drawText(self.rect(), Qt.AlignCenter,
                        "Click a word to see its line's vowel trajectory")
             return
+
+        # Derive label strip height from actual font metrics to avoid clipping
+        f_label = QFont('Charis SIL', round(12 * self._ui_scale))
+        fm_label = QFontMetrics(f_label)
+        label_strip_h = fm_label.height() + _scale(4)
 
         n = len(self._items)
         margin = _scale(10)
@@ -1875,7 +1910,7 @@ class PhraseTrajectoryBar(QWidget):
         cell_total_w = (usable_w - total_gap_w) / n if n > 0 else 0
 
         bar_top = _scale(10)
-        bar_h = self.height() - _scale(20) - _scale(20)
+        bar_h = self.height() - bar_top - label_strip_h - _scale(8)
 
         self._cell_rects = []
         x = float(margin)
@@ -1898,13 +1933,12 @@ class PhraseTrajectoryBar(QWidget):
                                   cell_w + 2, bar_h + 2, _scale(5), _scale(5))
 
             p.setPen(QColor('#d8dfe8'))
-            f = QFont('Charis SIL', round(12 * _dpr()))
-            p.setFont(f)
-            p.drawText(cell_x, bar_top + bar_h + _scale(2),
-                       cell_w, _scale(18), Qt.AlignCenter, vsym)
+            p.setFont(f_label)
+            label_y = bar_top + bar_h + _scale(2)
+            p.drawText(cell_x, label_y, cell_w, fm_label.height(),
+                       Qt.AlignCenter, vsym)
 
             x += cell_total_w
-
 
     def mousePressEvent(self, ev):
         if ev.button() != Qt.LeftButton or not self._cell_rects:
@@ -2289,7 +2323,7 @@ class CustomIpaDialog(QDialog):
         default.setWordWrap(True)
 
         self.edit = QLineEdit()
-        f = QFont('Charis SIL', round(14 * _dpr()))
+        f = QFont('Charis SIL', 14)
         self.edit.setFont(f)
         self.edit.setText(current_ipa or '')
         self.edit.setPlaceholderText('e.g. valʒɑ̃')
@@ -2460,13 +2494,7 @@ class MainWindow(QMainWindow):
         self._save_timer.timeout.connect(self._persist_songs)
 
         self._editor_font_size = 16
-        # Seed UI scale from DPR so a 4K/HiDPI screen gets a sane first-run size.
-        # The user can adjust from View → Adjust UI Scale.
-        dpr_default = _dpr()
-        self._ui_scale: float = 1.0 / dpr_default if dpr_default > 1.0 else 1.0
-        # Push into the module-level var so _scale() / _scalef() work during
-        # widget construction inside _init_ui() below.
-        _apply_ui_scale(self._ui_scale)
+        self._ui_scale: float = 1.0  # adjusted via View → Adjust UI Scale
         self._annotations_enabled = True
         self._enabled_hint_types = {'legato','vowel_glide','crash','r_toxicity','dark_l','glottal','plosive','nasal','approx','fricative','yod','ng_release','diphthong','aspiration'}
         self._word_annotations = []
@@ -2641,8 +2669,9 @@ class MainWindow(QMainWindow):
             value=pct, min=25, max=200, step=5)
         if ok:
             self._ui_scale = new_pct / 100.0
-            _apply_ui_scale(self._ui_scale)
             self.setStyleSheet(build_style(_dpr(), self._ui_scale))
+            self.trajectory.setUiScale(self._ui_scale)
+            self.analysis.card.brightness_bar.setUiScale(self._ui_scale)
 
     def _adjust_font_size(self):
         new, ok = QInputDialog.getInt(
@@ -3465,12 +3494,12 @@ class MainWindow(QMainWindow):
         if self.settings.contains('uiScale'):
             self._ui_scale = float(self.settings.value('uiScale', self._ui_scale))
         elif self.settings.contains('uiFontScale'):
-            # Old setting stored font-scale relative to full DPR — convert it.
-            old = float(self.settings.value('uiFontScale', 1.0))
-            self._ui_scale = old / _dpr() if _dpr() > 0 else old
-        # else keep the DPR-normalised default set in __init__
-        _apply_ui_scale(self._ui_scale)
+            # Old setting stored a font-only scale — treat it as the overall scale.
+            self._ui_scale = float(self.settings.value('uiFontScale', 1.0))
+        # else keep default 1.0
         self.setStyleSheet(build_style(_dpr(), self._ui_scale))
+        self.trajectory.setUiScale(self._ui_scale)
+        self.analysis.card.brightness_bar.setUiScale(self._ui_scale)
         # Persist enabled hint types
         saved_hints = self.settings.value('enabledHintTypes', None)
         if saved_hints is not None:
