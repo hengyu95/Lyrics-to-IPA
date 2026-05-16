@@ -212,11 +212,15 @@ _V = [
           'ʌ'),
     Vowel('o', 250, 100, True,  'close-mid back rounded',
           'mid-high', 'back', 'rounded',
-          'Round and dark. Sustain by keeping internal space — never by pursing.',
-          None),
+          'Round and dark. Sustain by keeping internal space — never by pursing. '
+          'At high pitch, allow slight opening toward /ɔ/, preserving the lip-round.',
+          'ɔ'),
     Vowel('ʌ', 250, 200, False, 'open-mid back unrounded',
           'mid-low', 'back', 'neutral',
-          'American "cup". Often migrates toward /ɔ/ at high pitch.',
+          'American "cup". At high pitch some classical singers open toward /ɔ/ '
+          '(British/round school); most American legit teachers prefer opening toward /ɑ/ '
+          'to preserve the unrounded quality. Both are defensible — choose consciously '
+          'and stay consistent within a phrase.',
           'ɔ'),
     Vowel('ɔ', 250, 200, True,  'open-mid back rounded',
           'mid-low', 'back', 'rounded',
@@ -458,10 +462,17 @@ def _tts_speak(word: str, ipa_pron: str = '') -> None:
                 f'$s.SpeakSsml([System.IO.File]::ReadAllText("{ps_path}")); '
                 f'Remove-Item "{ps_path}"'
             )
-            subprocess.Popen(
-                ['powershell', '-WindowStyle', 'Hidden', '-Command', ps_cmd],
-                creationflags=0x08000000,
-            )
+            try:
+                subprocess.Popen(
+                    ['powershell', '-WindowStyle', 'Hidden', '-Command', ps_cmd],
+                    creationflags=0x08000000,
+                )
+            except (OSError, FileNotFoundError):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
 
         elif sys.platform == 'darwin':
             subprocess.Popen(['say', word])
@@ -495,7 +506,7 @@ class WordAnnotation:
 # Tokenization & syllable extraction
 # =============================================================================
 
-WORD_RE = re.compile(r"[A-Za-z]+(?:['\u2019][A-Za-z]+)*|[0-9]+")
+WORD_RE = re.compile(r"[A-Za-z]+(?:['\u2018\u2019][A-Za-z]+)*|[0-9]+")
 
 VOWEL_CHARS = ''.join(VOWELS.keys())
 _vowel_re = re.compile(
@@ -618,8 +629,11 @@ IPA_UNVOICED = {'p', 't', 'k', 'f', 's', 'ʃ', 'h', 'θ', 'tʃ'}
 IPA_SIBILANT = {'s', 'z', 'ʃ', 'ʒ', 'tʃ', 'dʒ'}
 
 # Vowel-glide routing: which semi-vowel to insert before next vowel
-_GLIDE_J = {'i','ɪ','e','ɛ','æ','eɪ','aɪ','ɔɪ','ɪə','eə'}
-_GLIDE_W = {'u','ʊ','o','ɔ','oʊ','aʊ','ʊə'}
+# Front/central vowels → /j/ glide before next vowel
+_GLIDE_J = {'i','ɪ','e','ɛ','æ','ə','ɜ','ɐ','ɨ','eɪ','aɪ','ɔɪ','ɪə','eə'}
+# Back/round vowels → /w/ glide before next vowel
+_GLIDE_W = {'u','ʊ','o','ɔ','ʌ','ɑ','ɒ','oʊ','aʊ','ʊə'}
+# Anything in neither set (rare) defaults to /j/
 
 
 def ipa_ends_with_vowel(pron: str) -> Optional[str]:
@@ -661,7 +675,79 @@ def consonant_crash_tip(trailing: list, next_leading: str) -> Optional[str]:
     return None
 
 
-# Background tint colors (annotation type → bg hex blended with #14181f at ~30%)
+def _check_yod_coalescence(pron: str, next_ipa: Optional[str]) -> Optional[str]:
+    """Detect /d/ or /t/ word-final before /j/ word-initial (yod-coalescence zone).
+    e.g. 'did you' → potential /dɪdʒu/, 'don't you' → /doʊntʃu/.
+    Returns a tip string if applicable, else None.
+    """
+    if not next_ipa:
+        return None
+    trailing = ipa_trailing_consonants(pron)
+    if not trailing:
+        return None
+    last = trailing[-1]
+    if last not in ('d', 't'):
+        return None
+    leading = next_ipa.lstrip('ˈˌ')
+    if not leading.startswith('j'):
+        return None
+    result = 'dʒ' if last == 'd' else 'tʃ'
+    return (f'Yod-coalescence — /{last}/ + /j/ may coalesce to /{result}/. '
+            f'In speech this is natural; in sung diction decide whether you want '
+            f'the coalescence or prefer to articulate both consonants cleanly.')
+
+
+def _check_ng_release(pron: str) -> Optional[str]:
+    """Detect word-final /ŋ/ that might attract a spurious /g/ tail.
+    e.g. 'singing' — the /g/ should never sound; /ŋ/ closes nasally.
+    """
+    trailing = ipa_trailing_consonants(pron)
+    if trailing and trailing[-1] == 'ŋ':
+        return ('/ŋ/ exit — release nasally into silence. '
+                'No /g/ tail after /ŋ/ in standard singing diction. '
+                'Keep the back of the tongue raised against the soft palate '
+                'and let the tone die there.')
+    return None
+
+
+def _check_spurious_diphthong(pron: str) -> Optional[str]:
+    """Detect monophthong vowels that commonly attract a spurious glide in casual speech.
+    Most at-risk: /ɔ/ → [ɔʊ], /o/ → [oʊ] in non-rhyming positions, /ɑ/ → [ɑʊ].
+    """
+    syls = find_syllable_vowels(pron)
+    if not syls:
+        return None
+    # Check the last (most likely sustained) syllable vowel
+    sym = syls[-1][0]
+    risky = {
+        'ɔ': ('/ɔ/', '/ɔʊ/'),
+        'ɑ': ('/ɑ/', '/ɑʊ/'),
+        'o': ('/o/', '/oʊ/'),
+    }
+    if sym in risky:
+        mono, spurious = risky[sym]
+        return (f'Monophthong risk — sustain {mono} as a pure vowel. '
+                f'Resist the tendency to add a {spurious} glide-off '
+                f'at the end of the note; that diphthongization is a speech '
+                f'habit that muddies sustained tones.')
+    return None
+
+
+def _check_h_aspiration(pron: str) -> Optional[str]:
+    """Flag word-initial /h/ — relevant at high pitch where aspiration can
+    cause audible pre-phonation breath leak before the vowel onset.
+    """
+    stripped = pron.lstrip('ˈˌ')
+    if stripped.startswith('h'):
+        return ('/h/ onset — at high pitch, under-aspirate: '
+                'bring the cords to closure before releasing the breath '
+                'so the vowel onset is clean rather than breathy. '
+                'Coordinate sub-glottal pressure with glottal closure '
+                'rather than puffing air before the tone.')
+    return None
+
+
+
 ANN_BG = {
     'legato':      '#3a3220',
     'vowel_glide': '#1e2e1e',
@@ -673,6 +759,10 @@ ANN_BG = {
     'nasal':       '#1a2e28',
     'approx':      '#1a2838',
     'fricative':   '#281a36',
+    'yod':         '#2e2a18',
+    'ng_release':  '#1a2e20',
+    'diphthong':   '#301a2a',
+    'aspiration':  '#1e2830',
 }
 # Foreground underline colors
 ANN_COLOR = {
@@ -686,7 +776,16 @@ ANN_COLOR = {
     'nasal':       '#78b8a0',
     'approx':      '#7898d0',
     'fricative':   '#9878b0',
+    'yod':         '#c8b848',
+    'ng_release':  '#68c898',
+    'diphthong':   '#c878a8',
+    'aspiration':  '#78a8c8',
 }
+
+
+# Module-level cache for plain dictionary lookups (no custom IPA).
+# Custom IPA is layered on top in get_pronunciations().
+_DICT_CACHE: dict = {}
 
 
 def dedupe_pronunciations(items):
@@ -707,15 +806,19 @@ def get_pronunciations(word: str, custom_ipa: Optional[dict] = None):
     if word_l in FUNCTION_WORDS:
         return FUNCTION_WORDS[word_l].copy()
 
+    if word_l in _DICT_CACHE:
+        return _DICT_CACHE[word_l]
     raw = ipa.convert(word_l, retrieve_all=True) or []
-    cleaned = [p for p in raw if p and '*' not in p]
+    cleaned = [p.replace('ː', '') for p in raw if p and '*' not in p]
 
-    if not cleaned and ("'" in word_l or '\u2019' in word_l):
-        stripped = word_l.replace("'", '').replace('\u2019', '')
+    if not cleaned and ("'" in word_l or '\u2019' in word_l or '\u2018' in word_l):
+        stripped = word_l.replace("'", '').replace('\u2019', '').replace('\u2018', '')
         raw = ipa.convert(stripped, retrieve_all=True) or []
-        cleaned = [p for p in raw if p and '*' not in p]
+        cleaned = [p.replace('ː', '') for p in raw if p and '*' not in p]
 
-    return dedupe_pronunciations(cleaned)
+    result = dedupe_pronunciations(cleaned)
+    _DICT_CACHE[word_l] = result
+    return result
 
 
 def pronunciation_brightness(p: str) -> float:
@@ -937,13 +1040,18 @@ class Song:
     style: str = 'classical'  # 'classical' | 'mt_ccm'
     sustained_words: set = field(default_factory=set)  # words marked as sustained
 
+    def _present_words(self):
+        """Set of lowercase words currently in the lyrics."""
+        return {m.group().lower() for m in WORD_RE.finditer(self.lyrics)}
+
     def to_dict(self):
+        pw = self._present_words()
         return {'name': self.name, 'lyrics': self.lyrics,
-                'custom_ipa': dict(self.custom_ipa),
-                'pron_choices': dict(self.pron_choices),
-                'dismissed_tips': list(self.dismissed_tips),
+                'custom_ipa': {k: v for k, v in self.custom_ipa.items() if k in pw},
+                'pron_choices': {k: v for k, v in self.pron_choices.items() if k in pw},
+                'dismissed_tips': [w for w in self.dismissed_tips if w in pw],
                 'style': self.style,
-                'sustained_words': list(self.sustained_words)}
+                'sustained_words': [w for w in self.sustained_words if w in pw]}
 
     @classmethod
     def from_dict(cls, d):
@@ -981,8 +1089,10 @@ class SongStore:
                 'songs': [s.to_dict() for s in songs],
                 'active_index': active_index,
             }
-            with open(self.path, 'w', encoding='utf-8') as f:
+            tmp = self.path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.path)  # atomic on Windows and POSIX
         except (IOError, OSError) as e:
             print(f'Warning: failed to save songs: {e}', file=sys.stderr)
 
@@ -1296,7 +1406,7 @@ class AspectRatioContainer(QWidget):
 
 
 class LyricsEditor(QTextEdit):
-    word_clicked = pyqtSignal(str, int)
+    word_clicked = pyqtSignal(str, int, int)  # word, block_number, char_offset
     word_ipa_requested = pyqtSignal(str)
     content_changed = pyqtSignal()
     annotation_dismissed = pyqtSignal(str)   # word_lower
@@ -1319,9 +1429,9 @@ class LyricsEditor(QTextEdit):
         block = cursor.block()
         pos_in_block = cursor.positionInBlock()
         for m in WORD_RE.finditer(block.text()):
-            if m.start() <= pos_in_block <= m.end():
-                return m.group(), block.blockNumber()
-        return None, -1
+            if m.start() <= pos_in_block < m.end():
+                return m.group(), block.blockNumber(), m.start()
+        return None, -1, -1
 
 
     def set_annotations(self, annotations: list):
@@ -1370,13 +1480,13 @@ class LyricsEditor(QTextEdit):
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
         if event.button() == Qt.LeftButton:
-            word, bn = self._word_at_cursor_pos(event.pos())
+            word, bn, offset = self._word_at_cursor_pos(event.pos())
             if word:
-                self.word_clicked.emit(word.lower(), bn)
+                self.word_clicked.emit(word.lower(), bn, offset)
 
     def contextMenuEvent(self, event):
         menu = self.createStandardContextMenu()
-        word, _ = self._word_at_cursor_pos(event.pos())
+        word, _, _offset = self._word_at_cursor_pos(event.pos())
         ann = self._annotation_at_pos(event.pos())
         if word:
             menu.addSeparator()
@@ -1693,6 +1803,8 @@ class ArticulationCard(QFrame):
 
 
 class PhraseTrajectoryBar(QWidget):
+    vowel_cell_clicked = pyqtSignal(int)  # trajectory cell index
+
     def __init__(self):
         super().__init__()
         h = _scale(72)
@@ -1700,6 +1812,8 @@ class PhraseTrajectoryBar(QWidget):
         self.setMaximumHeight(h)
         self._items = []  # (vowel_symbol, word_index)
         self._highlight_index = -1
+        self._cell_rects = []  # list of (x, w) per cell, built in paintEvent
+        self.setCursor(Qt.PointingHandCursor)
 
     def set_phrase(self, items):
         self._items = list(items)
@@ -1740,6 +1854,7 @@ class PhraseTrajectoryBar(QWidget):
         bar_top = _scale(10)
         bar_h = self.height() - _scale(20) - _scale(20)
 
+        self._cell_rects = []
         x = float(margin)
         for i, (vsym, wi) in enumerate(self._items):
             if i > 0 and word_indices[i] != word_indices[i - 1]:
@@ -1750,6 +1865,7 @@ class PhraseTrajectoryBar(QWidget):
             p.setBrush(color)
             cell_x = int(x)
             cell_w = max(2, int(cell_total_w) - 2)
+            self._cell_rects.append((cell_x, cell_w))
             p.drawRoundedRect(cell_x, bar_top, cell_w, bar_h, _scale(4), _scale(4))
 
             if i == self._highlight_index:
@@ -1765,6 +1881,16 @@ class PhraseTrajectoryBar(QWidget):
                        cell_w, _scale(18), Qt.AlignCenter, vsym)
 
             x += cell_total_w
+
+
+    def mousePressEvent(self, ev):
+        if ev.button() != Qt.LeftButton or not self._cell_rects:
+            return
+        x = ev.x()
+        for i, (cx, cw) in enumerate(self._cell_rects):
+            if cx <= x < cx + cw:
+                self.vowel_cell_clicked.emit(i)
+                return
 
 
 class AnalysisPanel(QWidget):
@@ -1903,15 +2029,18 @@ class AnalysisPanel(QWidget):
             inner_l.setContentsMargins(_scale(14), _scale(8), _scale(14), _scale(8))
             inner_l.addWidget(inner)
             btn.clicked.connect(
-                lambda _, idx=i: self._select_pronunciation(idx))
+                lambda _, idx=i: self._select_pronunciation(idx, from_user=True))
             self.alt_layout.addWidget(btn)
 
-    def _select_pronunciation(self, idx):
+    def _select_pronunciation(self, idx, from_user: bool = False):
         if idx < 0 or idx >= len(self._pronunciations):
             return
         self._current_pron_index = idx
         p = self._pronunciations[idx]
-        self.pronunciation_chosen.emit(self._current_word, idx)
+        # Only persist the choice when the user explicitly clicked an alt button,
+        # not during the auto-init call from show_word (Bug 3 fix).
+        if from_user:
+            self.pronunciation_chosen.emit(self._current_word, idx)
         self._update_word_tips(p)
 
         for i in range(self.alt_layout.count()):
@@ -1948,10 +2077,19 @@ class AnalysisPanel(QWidget):
 
     def _set_current_vowel(self, sym, index=None):
         if index is None and sym is not None:
+            # When multiple syllables share the same symbol (e.g. "bobo" → /oʊ/,/oʊ/),
+            # prefer the syllable nearest the current one rather than always the first.
+            # Falls back to first match if no current index is tracked.
+            cur = self._current_pron_index  # reuse as a rough "last syllable touched" hint
+            best = None
+            best_dist = float('inf')
             for i, (s, _, _) in enumerate(self._current_syllables):
                 if s == sym:
-                    index = i
-                    break
+                    dist = abs(i - cur)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best = i
+            index = best
         self._current_vowel = sym
         self.chart.show_vowel(sym)
         self.card.show_phone(sym)
@@ -1989,11 +2127,11 @@ class AnalysisPanel(QWidget):
         # Priority mirrors _compute_annotations exactly
         if trailing and next_leading_v is not None:
             cd = ' '.join(f'/{c}/' for c in trailing)
-            legato_text = (f'\u2197 Legato \u2014 carry {cd} into /{next_leading_v}/ '
+            legato_text = (f'Legato \u2014 carry {cd} into the opening /{next_leading_v}/ '
                            f'of the next word. Keep the breath connected.')
         elif end_vowel is not None and next_leading_v is not None:
             glide = '/j/' if end_vowel in _GLIDE_J else '/w/'
-            legato_text = (f'Vowel-to-vowel \u2014 insert {glide} to avoid '
+            legato_text = (f'Vowel-to-vowel \u2014 insert a soft {glide} glide to avoid '
                            f'a glottal stop before /{next_leading_v}/. Keep airflow open.')
         elif trailing and next_leading_c is not None:
             crash = consonant_crash_tip(trailing, next_leading_c)
@@ -2038,6 +2176,12 @@ class AnalysisPanel(QWidget):
         else:
             self.card.set_stress_warning('')
 
+    def select_vowel_at(self, syllable_idx: int):
+        """Public: select vowel at position *syllable_idx* in current pronunciation."""
+        if syllable_idx < len(self._current_syllables):
+            sym, _, _ = self._current_syllables[syllable_idx]
+            self._set_current_vowel(sym, syllable_idx)
+
     def _clear_alts(self):
         while self.alt_layout.count():
             item = self.alt_layout.takeAt(0)
@@ -2067,7 +2211,7 @@ class AnalysisPanel(QWidget):
             tips.append('Sustained /æ/ — risk of pinching at height. '
                         'Classical: relax toward /ɛ/. '
                         'Belt/MT: keep the brightness but release jaw tension.')
-        if vowel not in ('ə', 'ɔ', 'ɑ', 'æ'):
+        if vowel not in ('i', 'y', 'u', 'ʊ', 'æ'):
             tips.append('Vibrato: aim for a natural oscillation centred on '
                         'the written pitch. '
                         'If the note is marked straight (non-vibrato), '
@@ -2161,7 +2305,27 @@ class CustomIpaDialog(QDialog):
     def result_ipa(self):
         if self._reset_clicked:
             return ''
-        return self.edit.text().strip().strip('/')
+        import unicodedata
+        raw = self.edit.text().strip().strip('/')
+        raw = unicodedata.normalize('NFC', raw).strip()
+        if not raw:
+            return ''
+        # Warn if no recognisable vowel or diphthong found
+        has_vowel = any(
+            raw[i:i+2] in DIPHTHONGS or raw[i] in VOWELS
+            for i in range(len(raw))
+        )
+        if not has_vowel:
+            from PyQt5.QtWidgets import QMessageBox
+            res = QMessageBox.warning(
+                self, 'No vowel found',
+                f'The IPA string "{raw}" contains no recognised vowel or '
+                f'diphthong. Save anyway?',
+                QMessageBox.Save | QMessageBox.Cancel,
+                QMessageBox.Cancel)
+            if res != QMessageBox.Save:
+                return None  # caller treats None as 'user cancelled'
+        return raw
 
 
 class SongSelectorBar(QWidget):
@@ -2266,6 +2430,7 @@ class MainWindow(QMainWindow):
         self._current_block_number = -1
         self._current_line_items = []
         self._current_clicked_word_idx = -1
+        self._missing_audio_warned: set = set()  # warn once per missing symbol
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(600)
@@ -2274,7 +2439,7 @@ class MainWindow(QMainWindow):
         self._editor_font_size = 16
         self._ui_font_scale = 1.0
         self._annotations_enabled = True
-        self._enabled_hint_types = {'legato','vowel_glide','crash','r_toxicity','dark_l','glottal','plosive','nasal','approx','fricative'}
+        self._enabled_hint_types = {'legato','vowel_glide','crash','r_toxicity','dark_l','glottal','plosive','nasal','approx','fricative','yod','ng_release','diphthong','aspiration'}
         self._word_annotations = []
         self._annotation_timer = QTimer(self)
         self._annotation_timer.setSingleShot(True)
@@ -2370,6 +2535,7 @@ class MainWindow(QMainWindow):
         self.analysis.play_requested.connect(self._play_vowel)
         self.analysis.vowel_selected.connect(self._on_vowel_selected_in_analysis)
         self.analysis.pronunciation_chosen.connect(self._on_pronunciation_chosen)
+        self.trajectory.vowel_cell_clicked.connect(self._on_trajectory_cell_clicked)
 
         analysis_scroll = QScrollArea()
         analysis_scroll.setWidgetResizable(True)
@@ -2394,6 +2560,13 @@ class MainWindow(QMainWindow):
         s.addAction(a)
         a = QAction('&Generate IPA Prompt to Clipboard', self)
         a.triggered.connect(self._on_generate_prompt)
+        s.addAction(a)
+        s.addSeparator()
+        a = QAction('Export Cheat Sheet (Markdown)...', self)
+        a.triggered.connect(lambda: self._on_export_cheat_sheet('md'))
+        s.addAction(a)
+        a = QAction('Export Cheat Sheet (PDF)...', self)
+        a.triggered.connect(lambda: self._on_export_cheat_sheet('pdf'))
         s.addAction(a)
         s.addSeparator()
         a = QAction('Reset Dismissed Hints', self)
@@ -2533,7 +2706,7 @@ class MainWindow(QMainWindow):
         if dlg.exec_() != QDialog.Accepted:
             return
         new = dlg.result_ipa()
-        if new is None:
+        if new is None:  # user cancelled (including cancel on vowel warning)
             return
         if new == '':
             custom.pop(word_l, None)
@@ -2562,28 +2735,42 @@ class MainWindow(QMainWindow):
             self._update_trajectory(self.editor.line_text(self._current_block_number))
 
     def _context_aware_pronunciations(self, word, next_ipa=None):
-        """Like _cached_pronunciations but applies next-word context rules.
-
-        Feature 4: 'the' → /ði/ before a vowel, /ðə/ before a consonant.
+        """Apply next-word context rules to select a pronunciation.
+        'the'  -> /ði/ before a vowel, /ðə/ before a consonant.
+        'a'    -> contemporary default /ə/ before all words; /eɪ/ is an older
+                  stage-diction convention (contested in newer coaching) but both
+                  forms remain available in the PRONUNCIATIONS panel for a conscious
+                  stylistic choice.
+        'to'   -> /tu/ before a vowel, /tə/ otherwise.
         """
         prons = self._cached_pronunciations(word)
-        if not next_ipa or word.lower() not in ('the',):
+        wl = word.lower()
+        if not next_ipa or wl not in ('the', 'to'):
             return prons
-        if word.lower() == 'the':
-            return ['ði'] if ipa_leading_vowel(next_ipa) is not None else ['ðə']
+        vowel_next = ipa_leading_vowel(next_ipa) is not None
+        if wl == 'the':
+            return ['ði'] if vowel_next else ['ðə']
+        if wl == 'to':
+            return ['tu'] if vowel_next else ['tə']
         return prons
 
-    def _get_next_word_ipa(self, line_text: str, clicked_word: str) -> Optional[str]:
-        """Return first pronunciation IPA of the next word, or None if
-        there is a punctuation boundary between them.
+    def _get_next_word_ipa(self, line_text: str, clicked_word: str,
+                           clicked_offset: int = -1) -> Optional[str]:
+        """Return the preferred IPA for the word immediately after *clicked_word*
+        in *line_text*, or None at a punctuation boundary.
+        Uses *clicked_offset* (char position in line) to disambiguate repeated words.
         """
         matches = list(WORD_RE.finditer(line_text))
-        clicked_l = clicked_word.lower()
         for i, m in enumerate(matches):
-            if m.group().lower() == clicked_l and i + 1 < len(matches):
+            # Match by position when available, else by string (fallback)
+            pos_match = (clicked_offset >= 0 and
+                         m.start() <= clicked_offset < m.end())
+            str_match = (clicked_offset < 0 and
+                         m.group().lower() == clicked_word.lower())
+            if (pos_match or str_match) and i + 1 < len(matches):
                 between = line_text[m.end():matches[i + 1].start()]
                 if re.search(r'[,;:.!?]', between):
-                    return None   # punctuation boundary — suppress legato
+                    return None
                 nw = matches[i + 1].group()
                 next_prons = self._context_aware_pronunciations(nw, None)
                 if not next_prons:
@@ -2607,6 +2794,10 @@ class MainWindow(QMainWindow):
         'nasal':       'Nasal exits',
         'approx':      'Approximant exits',
         'fricative':   'Fricative exits',
+        'yod':         'Yod-coalescence',
+        'ng_release':  '/ŋ/ release (no G tail)',
+        'diphthong':   'Spurious diphthongization',
+        'aspiration':  '/h/ aspiration at height',
     }
 
     def _build_style_menu(self) -> QMenu:
@@ -2751,7 +2942,10 @@ class MainWindow(QMainWindow):
                     continue
 
                 # ── glottal onset check (this word opens a phrase) ────────
-                # True if word is first on the line, or preceded by punctuation
+                # True if word is first on the line, or preceded by punctuation.
+                # Stored as a pending annotation so a regular tip on the same
+                # (block, start, end) range takes priority (Bug 2 fix).
+                glottal_annotation = None
                 phrase_opener = (i == 0)
                 if not phrase_opener and i > 0:
                     before = line_text[matches[i-1].end():m.start()]
@@ -2761,8 +2955,8 @@ class MainWindow(QMainWindow):
                     prons_check = self._cached_pronunciations(word)
                     preferred_c = self._pron_index_cache.get(word_l, 0)
                     pron_check = prons_check[min(preferred_c, len(prons_check)-1)] if prons_check else ''
-                    if pron_check and ipa_leading_vowel(pron_check) is not None and word_l not in dismissed:
-                        annotations.append(WordAnnotation(
+                    if pron_check and ipa_leading_vowel(pron_check) is not None:
+                        glottal_annotation = WordAnnotation(
                             word=word, word_lower=word_l,
                             block=block_num, start=m.start(), end=m.end(),
                             abs_start=block.position() + m.start(),
@@ -2775,7 +2969,7 @@ class MainWindow(QMainWindow):
                                       'to avoid an unintentional glottal strike.'),
                             color=ANN_COLOR['glottal'],
                             bg_color=ANN_BG['glottal'],
-                        ))
+                        )
 
                 # ── next-word context ─────────────────────────────────────
                 next_ipa = None
@@ -2783,8 +2977,9 @@ class MainWindow(QMainWindow):
                 if i + 1 < len(matches):
                     between = line_text[m.end():matches[i + 1].start()]
                     has_punct_boundary = bool(re.search(r'[,;:.!?]', between))
-                    np = self._cached_pronunciations(matches[i + 1].group())
-                    next_ipa = np[0] if np else None
+                    nw = matches[i + 1].group()
+                    np = self._cached_pronunciations(nw)
+                    next_ipa = np[min(self._pron_index_cache.get(nw.lower(), 0), len(np) - 1)] if np else None
 
                 prons = self._context_aware_pronunciations(
                     word, None if has_punct_boundary else next_ipa)
@@ -2811,6 +3006,7 @@ class MainWindow(QMainWindow):
                     s in ('ɚ', 'ɝ') for s, _, _ in find_syllable_vowels(pron))
 
                 tip_type = tip = None
+                r_tip = None  # may stack with boundary tip (see below)
 
                 # 1. Legato (consonant end → next vowel start, no punct)
                 if trailing and next_leading_v is not None:
@@ -2832,15 +3028,21 @@ class MainWindow(QMainWindow):
                     if crash:
                         tip, tip_type = crash, 'crash'
 
-                # 4. R toxicity (trailing /r/ consonant or rhotic vowel)
-                if tip_type is None and (rhotics or has_rhotic_vowel):
-                    tip = ('American R — de-rhotacize: release the tongue curl/bunch '
-                           'before the note sustains. Sustain on the base vowel '
-                           '(ə or ɜ) instead of the r-colored form.')
-                    tip_type = 'r_toxicity'
+                # 4. R toxicity — stacks with boundary tips (legato/crash/glide)
+                #    A word like "her" before "answer" is doubly problematic: the
+                #    singer needs both the boundary note and the R-release note.
+                if (rhotics or has_rhotic_vowel) and 'r_toxicity' in self._enabled_hint_types:
+                    r_tip = ('American R — de-rhotacize: release the tongue curl/bunch '
+                             'before the note sustains. Sustain on the base vowel '
+                             '(ə or ɜ) instead of the r-colored form.')
+                    if tip_type is None:
+                        tip = r_tip
+                        tip_type = 'r_toxicity'
+                        r_tip = None  # will be emitted as the primary tip below
 
                 # 5. Dark L — trailing /l/ not already captured as legato/crash
-                if tip_type is None and trailing and trailing[-1] == 'l':
+                #    Skipped in MT/CCM where dark-L is often stylistically neutral
+                if tip_type is None and trailing and trailing[-1] == 'l' and song_style != 'mt_ccm':
                     tip = ('Dark L exit \u2014 keep the tongue tip on the alveolar '
                            'ridge. Do not pull the tongue root back; that '
                            'swallows the resonance and darkens the sound.')
@@ -2865,10 +3067,13 @@ class MainWindow(QMainWindow):
                         tip = f'Fricative exit {s} — control the airstream.'
                         tip_type = 'fricative'
 
-                if tip_type is None:
+                if tip_type is None or tip_type not in self._enabled_hint_types:
+                    # No regular tip — emit glottal annotation if one was pending
+                    if glottal_annotation:
+                        annotations.append(glottal_annotation)
                     continue
-                if tip_type not in self._enabled_hint_types:
-                    continue
+
+                # Regular tip fires on this range — skip glottal to avoid overlap
 
                 annotations.append(WordAnnotation(
                     word=word, word_lower=word_l,
@@ -2879,6 +3084,76 @@ class MainWindow(QMainWindow):
                     color=ANN_COLOR[tip_type],
                     bg_color=ANN_BG[tip_type],
                 ))
+
+                # Stacked r_toxicity annotation (boundary tip already appended above)
+                if r_tip:
+                    annotations.append(WordAnnotation(
+                        word=word, word_lower=word_l,
+                        block=block_num, start=m.start(), end=m.end(),
+                        abs_start=block.position() + m.start(),
+                        abs_end=block.position() + m.end(),
+                        tip_type='r_toxicity', tip_text=r_tip,
+                        color=ANN_COLOR['r_toxicity'],
+                        bg_color=ANN_BG['r_toxicity'],
+                    ))
+
+                # 7. Supplementary word-level tips (stack freely with boundary tips)
+
+                # Yod-coalescence (/d/ or /t/ before next /j/)
+                if 'yod' in self._enabled_hint_types:
+                    yod = _check_yod_coalescence(pron, next_ipa)
+                    if yod:
+                        annotations.append(WordAnnotation(
+                            word=word, word_lower=word_l,
+                            block=block_num, start=m.start(), end=m.end(),
+                            abs_start=block.position() + m.start(),
+                            abs_end=block.position() + m.end(),
+                            tip_type='yod', tip_text=yod,
+                            color=ANN_COLOR['yod'],
+                            bg_color=ANN_BG['yod'],
+                        ))
+
+                # /ŋ/ release — no /g/ tail
+                if 'ng_release' in self._enabled_hint_types:
+                    ng = _check_ng_release(pron)
+                    if ng:
+                        annotations.append(WordAnnotation(
+                            word=word, word_lower=word_l,
+                            block=block_num, start=m.start(), end=m.end(),
+                            abs_start=block.position() + m.start(),
+                            abs_end=block.position() + m.end(),
+                            tip_type='ng_release', tip_text=ng,
+                            color=ANN_COLOR['ng_release'],
+                            bg_color=ANN_BG['ng_release'],
+                        ))
+
+                # Spurious diphthongization on monophthong vowels
+                if 'diphthong' in self._enabled_hint_types:
+                    dt = _check_spurious_diphthong(pron)
+                    if dt:
+                        annotations.append(WordAnnotation(
+                            word=word, word_lower=word_l,
+                            block=block_num, start=m.start(), end=m.end(),
+                            abs_start=block.position() + m.start(),
+                            abs_end=block.position() + m.end(),
+                            tip_type='diphthong', tip_text=dt,
+                            color=ANN_COLOR['diphthong'],
+                            bg_color=ANN_BG['diphthong'],
+                        ))
+
+                # /h/ aspiration at high pitch
+                if 'aspiration' in self._enabled_hint_types:
+                    asp = _check_h_aspiration(pron)
+                    if asp:
+                        annotations.append(WordAnnotation(
+                            word=word, word_lower=word_l,
+                            block=block_num, start=m.start(), end=m.end(),
+                            abs_start=block.position() + m.start(),
+                            abs_end=block.position() + m.end(),
+                            tip_type='aspiration', tip_text=asp,
+                            color=ANN_COLOR['aspiration'],
+                            bg_color=ANN_BG['aspiration'],
+                        ))
 
         self._word_annotations = annotations
         self.editor.set_annotations(annotations)
@@ -2896,17 +3171,17 @@ class MainWindow(QMainWindow):
                 word_lower in self.active_song.sustained_words,
                 self.analysis._current_vowel)
 
-    def _on_word_clicked(self, word, block_number):
+    def _on_word_clicked(self, word, block_number, char_offset=-1):
         self._current_block_number = block_number
         line = self.editor.line_text(block_number)
-        next_ipa = self._get_next_word_ipa(line, word)
+        next_ipa = self._get_next_word_ipa(line, word, char_offset)
         prons = self._context_aware_pronunciations(word, next_ipa)
         preferred = self._pron_index_cache.get(word.lower(), 0)
         self.analysis.show_word(word, prons, initial_index=preferred, next_ipa=next_ipa)
         self.analysis._show_sustained_tips(
             word.lower() in self.active_song.sustained_words,
             self.analysis._current_vowel)
-        self._update_trajectory(line)
+        self._update_trajectory(line, char_offset)
 
     def _cached_pronunciations(self, word):
         cache_key = word.lower()
@@ -2915,7 +3190,7 @@ class MainWindow(QMainWindow):
                 word, self.active_song.custom_ipa)
         return self._pron_cache[cache_key]
 
-    def _update_trajectory(self, line_text):
+    def _update_trajectory(self, line_text, clicked_offset: int = -1):
         items = []
         word_idx = 0
         clicked_word = self.analysis.word_label.text()
@@ -2926,8 +3201,9 @@ class MainWindow(QMainWindow):
             # Next word's IPA for context-aware function-word resolution
             next_ipa = None
             if i + 1 < len(matches):
-                np = self._cached_pronunciations(matches[i + 1].group())
-                next_ipa = np[0] if np else None
+                nw_word = matches[i + 1].group()
+                np = self._cached_pronunciations(nw_word)
+                next_ipa = np[min(self._pron_index_cache.get(nw_word.lower(), 0), len(np) - 1)] if np else None
             prons = self._context_aware_pronunciations(w, next_ipa)
             if not prons:
                 word_idx += 1
@@ -2937,7 +3213,11 @@ class MainWindow(QMainWindow):
             syls = find_syllable_vowels(pron)
             for sym, _, _ in syls:
                 items.append((sym, word_idx))
-            if w.lower() == clicked_word.lower():
+            # Match by char position when available; fall back to first string match.
+            # This disambiguates repeated words on the same line (Bug 4 fix).
+            pos_match = (clicked_offset >= 0 and m.start() <= clicked_offset < m.end())
+            str_match = (clicked_offset < 0 and w.lower() == clicked_word.lower())
+            if (pos_match or str_match) and clicked_word_idx == -1:
                 clicked_word_idx = word_idx
             word_idx += 1
         self._current_line_items = items
@@ -3004,6 +3284,21 @@ class MainWindow(QMainWindow):
         else:
             self.chiaroscuro_label.setVisible(False)
 
+    def _on_trajectory_cell_clicked(self, cell_index: int):
+        """A cell in the trajectory bar was clicked — select the corresponding
+        word and highlight the appropriate syllable in the analysis panel.
+        """
+        if not self._current_line_items or cell_index >= len(self._current_line_items):
+            return
+        vsym, word_idx = self._current_line_items[cell_index]
+        # Count which syllable index within that word this cell is
+        syl_idx = sum(1 for _, wi in self._current_line_items[:cell_index]
+                      if wi == word_idx)
+        self.trajectory.set_highlight(cell_index)
+        # Drive the analysis panel to that syllable if it's already showing the word
+        if self._current_clicked_word_idx == word_idx:
+            self.analysis.select_vowel_at(syl_idx)
+
     def _on_vowel_selected_in_analysis(self, syllable_idx):
         if not self._current_line_items:
             return
@@ -3034,6 +3329,11 @@ class MainWindow(QMainWindow):
                 self.player.setMedia(QMediaContent(QUrl.fromLocalFile(audio)))
                 self.player.play()
                 return
+        if sym not in self._missing_audio_warned:
+            self._missing_audio_warned.add(sym)
+            print(f'Audio: no file found for /{sym}/ (tried: '
+                  f'{[path.join("Audio", f"{c}.mp3") for c in candidates]})',
+                  file=sys.stderr)
 
     @staticmethod
     def _resource_path(relative):
@@ -3108,12 +3408,8 @@ class MainWindow(QMainWindow):
     def _on_open_save_folder(self):
         path_ = self.store.dir
         os.makedirs(path_, exist_ok=True)
-        if sys.platform == 'darwin':
-            os.system(f'open "{path_}"')
-        elif sys.platform == 'win32':
-            os.system(f'explorer "{path_}"')
-        else:
-            os.system(f'xdg-open "{path_}"')
+        from PyQt5.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path_))
 
     def _restore_state(self):
         geo = self.settings.value('geometry')
@@ -3147,7 +3443,170 @@ class MainWindow(QMainWindow):
                             act.setChecked(key in self._enabled_hint_types)
         self._update_hints_btn_label()
 
+
+    def _build_cheat_sheet_lines(self) -> list:
+        """Return a list of text lines for the cheat sheet."""
+        song = self.active_song
+        lines = []
+        lines.append(f'# {song.name}')
+        lines.append('')
+        lines.append('| Word | IPA | Style | Annotations |')
+        lines.append('|---|---|---|---|')
+        seen = set()
+        for m in WORD_RE.finditer(song.lyrics):
+            w = m.group()
+            wl = w.lower()
+            if wl in seen:
+                continue
+            seen.add(wl)
+            prons = self._context_aware_pronunciations(w, None)
+            preferred = self._pron_index_cache.get(wl, 0)
+            pron = prons[min(preferred, len(prons)-1)] if prons else '?'
+            style_tag = '⭐' if wl in song.sustained_words else ''
+            # Collect annotation tips for this word
+            tips = []
+            for ann in self._word_annotations:
+                if ann.word_lower == wl:
+                    tips.append(ann.tip_text)
+            tip_cell = '; '.join(tips) if tips else ''
+            lines.append(f'| {w} | /{pron}/ | {style_tag} | {tip_cell} |')
+        lines.append('')
+        lines.append(f'*Style: {song.style}  |  Generated by Lyric IPA Finder*')
+        return lines
+
+    def _on_export_cheat_sheet(self, fmt: str):
+        # Flush any pending annotation recompute so the tip column is current (Bug 7 fix).
+        self._annotation_timer.stop()
+        self._compute_annotations()
+        from PyQt5.QtWidgets import QFileDialog
+        name_safe = re.sub(r'[^\w\s-]', '', self.active_song.name).strip() or 'song'
+        ext = 'md' if fmt == 'md' else 'pdf'
+        default = f'{name_safe}_ipa.{ext}'
+        path_, _ = QFileDialog.getSaveFileName(
+            self, 'Export Cheat Sheet', default,
+            'Markdown (*.md)' if fmt == 'md' else 'PDF (*.pdf)')
+        if not path_:
+            return
+
+        lines = self._build_cheat_sheet_lines()
+
+        if fmt == 'md':
+            with open(path_, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+            QMessageBox.information(self, 'Exported',
+                                    f'Cheat sheet saved to:\n{path_}')
+            return
+
+        # PDF — try reportlab, fallback to HTML via QPrinter
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import mm
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+            from reportlab.lib import colors as rlc
+
+            doc = SimpleDocTemplate(path_, pagesize=A4,
+                                    leftMargin=20*mm, rightMargin=20*mm,
+                                    topMargin=20*mm, bottomMargin=20*mm)
+            styles = getSampleStyleSheet()
+            title_style = ParagraphStyle('Title2', parent=styles['Title'],
+                                         textColor=rlc.HexColor('#a8c8e8'))
+            cell_style  = ParagraphStyle('Cell', parent=styles['Normal'],
+                                         fontSize=9, leading=12)
+
+            story = [Paragraph(self.active_song.name, title_style), Spacer(1, 6*mm)]
+
+            # Table: Word | IPA | Annotations
+            table_data = [['Word', 'IPA', 'St.', 'Annotations']]
+            song = self.active_song
+            seen = set()
+            for m in WORD_RE.finditer(song.lyrics):
+                w = m.group()
+                wl = w.lower()
+                if wl in seen:
+                    continue
+                seen.add(wl)
+                prons = self._context_aware_pronunciations(w, None)
+                preferred = self._pron_index_cache.get(wl, 0)
+                pron = prons[min(preferred, len(prons)-1)] if prons else '?'
+                style_tag = '*' if wl in song.sustained_words else ''
+                tips = [ann.tip_text for ann in self._word_annotations
+                        if ann.word_lower == wl]
+                tip_str = '  |  '.join(tips) if tips else ''
+                table_data.append([
+                    Paragraph(w, cell_style),
+                    Paragraph(f'/{pron}/', cell_style),
+                    style_tag,
+                    Paragraph(tip_str, cell_style),
+                ])
+
+            col_widths = [35*mm, 45*mm, 8*mm, None]
+            t = Table(table_data, colWidths=col_widths, repeatRows=1)
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), rlc.HexColor('#1c2230')),
+                ('TEXTCOLOR',  (0, 0), (-1, 0), rlc.HexColor('#a8c8e8')),
+                ('FONTSIZE',   (0, 0), (-1, 0), 9),
+                ('GRID',       (0, 0), (-1, -1), 0.3, rlc.HexColor('#3a4258')),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1),
+                 [rlc.HexColor('#14181f'), rlc.HexColor('#1c2230')]),
+                ('TEXTCOLOR',  (0, 1), (-1, -1), rlc.HexColor('#d8dfe8')),
+                ('VALIGN',     (0, 0), (-1, -1), 'TOP'),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 4*mm))
+            story.append(Paragraph(
+                f'Style: {song.style}  |  Generated by Lyric IPA Finder',
+                styles['Italic']))
+            doc.build(story)
+            QMessageBox.information(self, 'Exported',
+                                    f'Cheat sheet saved to:\n{path_}')
+
+        except ImportError:
+            # reportlab not available — fall back to styled HTML rendered via QPrinter
+            from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
+            from PyQt5.QtGui import QTextDocument
+            printer = QPrinter(QPrinter.HighResolution)
+            printer.setOutputFormat(QPrinter.PdfFormat)
+            printer.setOutputFileName(path_)
+            printer.setPageSize(QPrinter.A4)
+            html_lines = ['<html><body style="font-family:sans-serif;color:#333">',
+                          f'<h2>{html.escape(self.active_song.name)}</h2>',
+                          '<table border="1" cellpadding="4" cellspacing="0" '
+                          'style="border-collapse:collapse;width:100%">',
+                          '<tr style="background:#1c2230;color:#a8c8e8">'
+                          '<th>Word</th><th>IPA</th><th>St.</th><th>Annotations</th></tr>']
+            song = self.active_song
+            seen = set()
+            for m in WORD_RE.finditer(song.lyrics):
+                w = m.group()
+                wl = w.lower()
+                if wl in seen:
+                    continue
+                seen.add(wl)
+                prons = self._context_aware_pronunciations(w, None)
+                preferred = self._pron_index_cache.get(wl, 0)
+                pron = prons[min(preferred, len(prons)-1)] if prons else '?'
+                sustained = '*' if wl in song.sustained_words else ''
+                tips = [ann.tip_text for ann in self._word_annotations
+                        if ann.word_lower == wl]
+                tip_str = html.escape('  |  '.join(tips))
+                html_lines.append(
+                    f'<tr><td>{html.escape(w)}</td>'
+                    f'<td>/{html.escape(pron)}/</td>'
+                    f'<td>{sustained}</td>'
+                    f'<td style="font-size:9pt">{tip_str}</td></tr>')
+            html_lines += ['</table>',
+                           f'<p><i>Style: {song.style} | Generated by Lyric IPA Finder</i></p>',
+                           '</body></html>']
+            doc = QTextDocument()
+            doc.setHtml('\n'.join(html_lines))
+            doc.print_(printer)
+            QMessageBox.information(self, 'Exported',
+                                    f'Cheat sheet saved to:\n{path_}')
+
     def closeEvent(self, event):
+        self._save_timer.stop()
+        self._annotation_timer.stop()
         self.active_song.lyrics = self.editor.toPlainText()
         self._persist_songs()
         self.settings.setValue('geometry', self.saveGeometry())
