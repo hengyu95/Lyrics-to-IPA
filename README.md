@@ -128,7 +128,3 @@ Each song slot remembers:
 Song data is stored in a single `songs.json` file. Use **Song > Open Save Folder** to find it. The exact path depends on your OS and how you launch the app.
 
 ---
-
-## Audio files
-
-The `Audio/` folder should be in the same directory as the script (or the app bundle if running a release). Vowel sound files are named by IPA symbol, e.g. `e.mp3`, `aI.mp3`. R-coloured vowels /ɚ/ and /ɝ/ fall back to /ə/ and /ɜ/ automatically if their files are missing. The release zip includes this folder pre-populated.
