@@ -2618,6 +2618,9 @@ class MainWindow(QMainWindow):
         a = QAction('&Generate IPA Prompt to Clipboard', self)
         a.triggered.connect(self._on_generate_prompt)
         s.addAction(a)
+        a = QAction('Generate &Direction Prompt to Clipboard', self)
+        a.triggered.connect(self._on_generate_direction_prompt)
+        s.addAction(a)
         s.addSeparator()
         a = QAction('Export Cheat Sheet (Markdown)...', self)
         a.triggered.connect(lambda: self._on_export_cheat_sheet('md'))
@@ -3471,6 +3474,112 @@ class MainWindow(QMainWindow):
             f'A prompt for {len(unknown)} unrecognized word(s) has been '
             f'copied to your clipboard. Paste it to an AI, then use '
             f'Song → Bulk Import IPAs… with the returned JSON.')
+
+    def _on_generate_direction_prompt(self):
+        lyrics = self.editor.toPlainText().strip()
+        if not lyrics:
+            QMessageBox.information(
+                self, 'Nothing to Research',
+                "This song has no lyrics yet. Add lyrics before generating "
+                "a direction prompt.")
+            return
+
+        name = self.active_song.name
+        placeholder_names = {'Untitled', 'New Song'}
+        if name in placeholder_names:
+            title_note = (
+                f'("{name}" may be a placeholder title — '
+                f'please identify the work from the lyrics alone)'
+            )
+        else:
+            title_note = ''
+
+        raw_style = getattr(self.active_song, 'style', 'classical')
+        if raw_style == 'mt_ccm':
+            style_phrase = 'musical theatre / CCM / pop'
+        else:
+            style_phrase = 'classical / legit'
+
+        title_line = f'"{name}"' + (f' {title_note}' if title_note else '')
+
+        prompt = (
+            f"You are a vocal coach, stage director, and music scholar. "
+            f"I am preparing to sing the following song and need detailed "
+            f"research and performance direction. The declared singing style "
+            f"is: {style_phrase}.\n\n"
+            f"Song title: {title_line}\n\n"
+            f"Full lyrics:\n{lyrics}\n\n"
+            f"Please respond in plain prose with the seven section headers "
+            f"listed below. No JSON, no code fences, no markdown tables. "
+            f"Where you cite a recording or production, give performer + year "
+            f"+ medium (cast album, film, broadcast). If a section genuinely "
+            f"does not apply to this song, say so briefly rather than padding. "
+            f"Cross-check the title — if it is ambiguous or appears in multiple "
+            f"works, state which one the lyrics match and explain why.\n\n"
+            f"1. Identification\n"
+            f"What work is this song from (musical, opera, art song cycle, song "
+            f"book, or standalone piece)? Name the composer and lyricist, the "
+            f"premiere year, and any version or edition notes that matter for "
+            f"diction or key. If you are uncertain about any detail, say so "
+            f"rather than guessing.\n\n"
+            f"2. Dramatic Context\n"
+            f"Who is the character singing, and to whom or about whom are they "
+            f"singing? Where does this number sit in the show or cycle — what "
+            f"immediately precedes and follows it? For non-theatrical repertoire "
+            f"(art song, Lieder), substitute poetic context: name the poet, the "
+            f"source poem or collection, and describe the speaker's situation.\n\n"
+            f"3. Emotional Arc\n"
+            f"How does the character's emotional state move across the song? "
+            f"Identify the turning points by lyric phrase (not bar number — I "
+            f"am working from a lyric sheet, not a score). Make this detailed "
+            f"enough that I can mark up the page.\n\n"
+            f"4. Acting Direction\n"
+            f"Give concrete, beat-by-beat acting notes: where to lean in, where "
+            f"to pull back, what subtext changes a line's reading, what physical "
+            f"stillness or gesture supports a specific moment. Avoid generic "
+            f"advice such as 'feel it deeply'. Prefer specifics tied to the "
+            f"text, for example: 'the word X on line Y should land harder than "
+            f"the surrounding phrase because it is the first absolute the "
+            f"character commits to'.\n\n"
+            f"5. Singing Direction\n"
+            f"Advise on vocal colour, dynamic shaping, straight tone versus "
+            f"vibrato, and breath strategy on long phrases. Tailor the advice "
+            f"to the declared style: for {style_phrase}, "
+        )
+
+        if raw_style == 'mt_ccm':
+            prompt += (
+                "favour speech-quality onsets, mix and belt considerations "
+                "where appropriate, and conversational rhythmic placement.\n\n"
+            )
+        else:
+            prompt += (
+                "favour legato, vibrato as the default tone, de-rhotacised r "
+                "in the Italian/German tradition, and balanced chiaroscuro.\n\n"
+            )
+
+        prompt += (
+            f"6. Tradition and Interpretation\n"
+            f"Describe well-known recordings or stage interpretations and how "
+            f"they differ from one another. Note where the standard reading "
+            f"has been challenged or where multiple defensible interpretations "
+            f"coexist. Name specific singers and productions where possible.\n\n"
+            f"7. Pitfalls\n"
+            f"List common mistakes that singers make specifically with this "
+            f"song — rushed phrases, misplaced emphases, vowel colour traps, "
+            f"dramatic choices that read as clichéd. Be specific: name the "
+            f"line or word and explain why the mistake happens and what to do "
+            f"instead."
+        )
+
+        QApplication.clipboard().setText(prompt)
+        QMessageBox.information(
+            self, 'Direction Prompt Copied',
+            "A research and direction prompt for "
+            f'"{name}" has been copied to your clipboard.\n\n'
+            "Paste it into an AI assistant and read the prose it returns. "
+            "This output is for your own study — it is not in a format "
+            "for Song \u2192 Bulk Import IPAs.")
 
     def _on_open_save_folder(self):
         path_ = self.store.dir
