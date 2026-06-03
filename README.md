@@ -52,16 +52,18 @@ Background tints on words in the lyrics. Hover to read the tip. Right-click to d
 
 | Colour | Type | What it flags |
 |---|---|---|
-| Amber | Legato link | Consonant-final word before a vowel-initial word. Carry the consonant across. |
-| Green | Vowel glide | Vowel-final word before a vowel-initial word. Insert /j/ or /w/ to avoid a glottal stop. |
-| Orange | Consonant crash | Stop-into-stop or stop-into-nasal at a word boundary. |
-| Red | R toxicity | Trailing /r/ or r-coloured vowel (/ɚ/, /ɝ/). De-rhotacize for classical/legit. |
-| Steel blue | Dark L | Trailing /l/. Keep the tongue tip forward; don't pull the root back. |
-| Purple | Phrase-initial glottal | Phrase or line opens on a vowel. Use a balanced onset unless a glottal attack is intentional. |
-| Coral | Plosive exit | Trailing stop. Snap off cleanly; no shadow vowel. |
-| Teal | Nasal / voiced fricative exit | Pitch-carrying consonant. Can be sustained for expressive weight. |
-| Blue | Approximant exit | /l/, /w/, /j/, /r/ exit. Advice differs per consonant. |
-| Lavender | Fricative exit | Voiced fricatives flagged as sustain resources; unvoiced as air-dump risks. |
+| Dark amber | Legato link | Consonant-final word before a vowel-initial word. Carry the consonant across. |
+| Olive | Vowel glide | Vowel-final word before a vowel-initial word. Insert /j/ or /w/ to avoid a glottal stop. |
+| Wine red | Consonant crash | Stop-into-stop or stop-into-nasal at a word boundary. |
+| Deep crimson | R toxicity | Trailing /r/ or r-coloured vowel (/ɚ/, /ɝ/). De-rhotacize for classical/legit. |
+| Dark maroon | Dark L | Trailing /l/. Keep the tongue tip forward; don't pull the root back. |
+| Deep wine | Phrase-initial glottal | Phrase or line opens on a vowel. Use a balanced onset unless a glottal attack is intentional. |
+| Teal | Plosive exit | Trailing stop. Snap off cleanly; no shadow vowel. |
+| Teal green | Nasal / voiced fricative exit | Pitch-carrying consonant. Can be sustained for expressive weight. |
+| Forest teal | Approximant exit | /l/, /w/, /j/, /r/ exit. Advice differs per consonant. |
+| Steel teal | Fricative exit | Voiced fricatives flagged as sustain resources; unvoiced as air-dump risks. |
+
+Hints are grouped into three hue families: **amber** (transitions — legato, vowel glide), **wine-red** (things to avoid — r toxicity, crashes, glottal, dark L), and **teal** (consonant exits). Underline colours remain individually distinctive and match the old palette if you find them easier to read.
 
 Punctuation (`,;:.!?`) suppresses legato tips at phrase boundaries. "the" automatically resolves to /ði/ before a vowel and /ðə/ before a consonant.
 

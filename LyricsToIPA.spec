@@ -2,7 +2,7 @@
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_submodules
 
-datas = [('Audio', 'Audio')]
+datas = [('Audio', 'Audio'), ('icon.png', '.')]
 hiddenimports = []
 datas += collect_data_files('eng_to_ipa')
 hiddenimports += collect_submodules('PyQt5.QtMultimedia')

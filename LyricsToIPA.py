@@ -32,8 +32,8 @@ os.environ.setdefault('QT_AUTO_SCREEN_SCALE_FACTOR', '1')
 
 from PyQt5.QtCore import (Qt, QUrl, QSettings, QStandardPaths, QTimer,
                           pyqtSignal)
-from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPalette,
-                         QTextCharFormat, QTextCursor)
+from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QIcon, QLinearGradient,
+                         QPainter, QPalette, QTextCharFormat, QTextCursor)
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtWidgets import (QAction, QApplication, QComboBox, QDialog,
                              QDialogButtonBox, QFrame, QHBoxLayout,
@@ -1211,9 +1211,29 @@ class Song:
 
     def to_dict(self):
         pw = self._present_words()
+        # pron_choices keys are either a plain lowercase word (legacy / word-level
+        # default) or an occurrence key "word#N" (N = 0-based index of that word
+        # among all its occurrences in the lyrics). Keep a key only if its base
+        # word is still present and, for occurrence keys, the index is still valid.
+        counts: dict = {}
+        for m in WORD_RE.finditer(self.lyrics):
+            wl = m.group().lower()
+            counts[wl] = counts.get(wl, 0) + 1
+
+        def keep_pron(k: str) -> bool:
+            if '#' in k:
+                base, _, idx = k.partition('#')
+                if base not in counts:
+                    return False
+                try:
+                    return int(idx) < counts[base]
+                except ValueError:
+                    return base in pw
+            return k in pw
+
         return {'name': self.name, 'lyrics': self.lyrics,
                 'custom_ipa': {k: v for k, v in self.custom_ipa.items() if k in pw},
-                'pron_choices': {k: v for k, v in self.pron_choices.items() if k in pw},
+                'pron_choices': {k: v for k, v in self.pron_choices.items() if keep_pron(k)},
                 'dismissed_tips': [w for w in self.dismissed_tips if w in pw],
                 'style': self.style,
                 'sustained_words': [w for w in self.sustained_words if w in pw]}
@@ -2615,6 +2635,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = QSettings('Heng', 'LyricIPAFinder')
         self.player = QMediaPlayer()
+        self.setWindowIcon(_app_icon())
 
         app_data = QStandardPaths.writableLocation(
             QStandardPaths.AppLocalDataLocation)
@@ -2624,11 +2645,22 @@ class MainWindow(QMainWindow):
         self.songs, self.active_index = self.store.load()
 
         self._pron_cache = {}
-        self._pron_index_cache = {}  # word -> preferred pronunciation index
+        self._pron_index_cache = {}  # pron_choices mirror (occurrence keys + legacy word keys)
         self._current_block_number = -1
         self._current_line_items = []
         self._current_clicked_word_idx = -1
+        self._current_clicked_occ_key = None  # "word#N" for the last-clicked occurrence
+        self._current_char_offset = -1  # in-block offset of the last-clicked word
         self._missing_audio_warned: set = set()  # warn once per missing symbol
+        # Sequential vowel playback (Play line vowels)
+        self._vowel_seq: list = []
+        self._vowel_seq_idx = 0
+        self._vowel_seq_active = False
+        self._seq_gap = QTimer(self)
+        self._seq_gap.setSingleShot(True)
+        self._seq_gap.setInterval(150)  # short pause between vowels
+        self._seq_gap.timeout.connect(self._advance_vowel_seq)
+        self.player.mediaStatusChanged.connect(self._on_media_status)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(600)
@@ -2690,6 +2722,16 @@ class MainWindow(QMainWindow):
         self._update_hints_btn_label()
         lh_layout.addWidget(lyrics_title)
         lh_layout.addStretch()
+        self.missing_ipa_btn = QToolButton()
+        self.missing_ipa_btn.setObjectName('HintsToggle')
+        self.missing_ipa_btn.setFixedHeight(_scale(22))
+        self.missing_ipa_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.missing_ipa_btn.setToolTip(
+            'Some words have no IPA pronunciation. Click to review and '
+            'generate an IPA prompt.')
+        self.missing_ipa_btn.clicked.connect(self._on_check_missing_ipa)
+        self.missing_ipa_btn.setVisible(False)
+        lh_layout.addWidget(self.missing_ipa_btn)
         self.style_btn = QToolButton()
         self.style_btn.setObjectName('HintsToggle')
         self.style_btn.setFixedHeight(_scale(22))
@@ -2715,7 +2757,22 @@ class MainWindow(QMainWindow):
         traj_caption.setWordWrap(True)
         self.trajectory = PhraseTrajectoryBar()
         ec_layout.addSpacing(_scale(4))
-        ec_layout.addWidget(traj_title)
+        traj_header = QWidget()
+        th_layout = QHBoxLayout(traj_header)
+        th_layout.setContentsMargins(0, 0, 0, 0)
+        th_layout.setSpacing(_scale(8))
+        th_layout.addWidget(traj_title)
+        th_layout.addStretch()
+        self.play_line_btn = QToolButton()
+        self.play_line_btn.setObjectName('HintsToggle')
+        self.play_line_btn.setFixedHeight(_scale(22))
+        self.play_line_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.play_line_btn.setText('▶  Play line vowels')
+        self.play_line_btn.setToolTip(
+            'Play every vowel in the current line in order, left to right.')
+        self.play_line_btn.clicked.connect(self._play_line_vowels)
+        th_layout.addWidget(self.play_line_btn)
+        ec_layout.addWidget(traj_header)
         ec_layout.addWidget(traj_caption)
         ec_layout.addWidget(self.trajectory)
         self.chiaroscuro_label = QLabel('')
@@ -2758,6 +2815,9 @@ class MainWindow(QMainWindow):
         s.addAction(a)
         a = QAction('&Generate IPA Prompt to Clipboard', self)
         a.triggered.connect(self._on_generate_prompt)
+        s.addAction(a)
+        a = QAction('&Check for Missing IPAs…', self)
+        a.triggered.connect(self._on_check_missing_ipa)
         s.addAction(a)
         a = QAction('Generate &Direction Prompt to Clipboard', self)
         a.triggered.connect(self._on_generate_direction_prompt)
@@ -2846,6 +2906,10 @@ class MainWindow(QMainWindow):
         self._current_line_items = []
         self._current_clicked_word_idx = -1
         self._current_block_number = -1
+        self._current_clicked_occ_key = None
+        self._current_char_offset = -1
+        self._vowel_seq_active = False
+        self._update_missing_ipa_indicator()
 
     def _on_song_changed(self, idx):
         if idx < 0 or idx >= len(self.songs) or idx == self.active_index:
@@ -2936,14 +3000,20 @@ class MainWindow(QMainWindow):
     # ---- Word handling ----
 
     def _on_pronunciation_chosen(self, word, idx):
-        """Remember the user's preferred pronunciation, persist it, and refresh trajectory."""
-        key = word.lower()
+        """Remember the user's preferred pronunciation for *this occurrence only*,
+        persist it, and refresh trajectory."""
+        key = self._current_clicked_occ_key
+        if key is None:
+            # No position context (shouldn't normally happen) — fall back to a
+            # word-level choice so the selection still takes effect somewhere.
+            key = word.lower()
         self._pron_index_cache[key] = idx
         self.active_song.pron_choices[key] = idx
         self._schedule_save()
         self._annotation_timer.start()
         if self._current_block_number >= 0:
-            self._update_trajectory(self.editor.line_text(self._current_block_number))
+            self._update_trajectory(self.editor.line_text(self._current_block_number),
+                                    self._current_char_offset)
 
     def _context_aware_pronunciations(self, word, next_ipa=None):
         """Apply next-word context rules to select a pronunciation.
@@ -2982,11 +3052,13 @@ class MainWindow(QMainWindow):
                 between = line_text[m.end():matches[i + 1].start()]
                 if re.search(r'[,;:.!?]', between):
                     return None
-                nw = matches[i + 1].group()
+                nxt = matches[i + 1]
+                nw = nxt.group()
                 next_prons = self._context_aware_pronunciations(nw, None)
                 if not next_prons:
                     return None
-                preferred = self._pron_index_cache.get(nw.lower(), 0)
+                nxt_abs = self._abs_offset(self._current_block_number, nxt.start())
+                preferred = self._preferred_index(nw.lower(), nxt_abs)
                 return next_prons[min(preferred, len(next_prons) - 1)]
         return None
 
@@ -3046,10 +3118,12 @@ class MainWindow(QMainWindow):
         # Rerun analysis panel tips for current word if any
         word = self.analysis.word_label.text()
         if word and word != 'Click a word to begin':
+            abs_start = self._abs_offset(self._current_block_number,
+                                         self._current_char_offset)
             prons = self._context_aware_pronunciations(word, self._get_next_word_ipa(
                 self.editor.line_text(self._current_block_number), word)
                 if self._current_block_number >= 0 else None)
-            preferred = self._pron_index_cache.get(word.lower(), 0)
+            preferred = self._preferred_index(word.lower(), abs_start)
             if prons:
                 self.analysis._update_word_tips(prons[min(preferred, len(prons)-1)])
 
@@ -3164,7 +3238,7 @@ class MainWindow(QMainWindow):
                 if phrase_opener and 'glottal' in self._enabled_hint_types:
                     # Only flag if the word starts with a vowel
                     prons_check = self._cached_pronunciations(word)
-                    preferred_c = self._pron_index_cache.get(word_l, 0)
+                    preferred_c = self._preferred_index(word_l, block.position() + m.start())
                     pron_check = prons_check[min(preferred_c, len(prons_check)-1)] if prons_check else ''
                     if pron_check and ipa_leading_vowel(pron_check) is not None:
                         glottal_annotation = WordAnnotation(
@@ -3188,15 +3262,16 @@ class MainWindow(QMainWindow):
                 if i + 1 < len(matches):
                     between = line_text[m.end():matches[i + 1].start()]
                     has_punct_boundary = bool(re.search(r'[,;:.!?]', between))
-                    nw = matches[i + 1].group()
+                    nxt = matches[i + 1]
+                    nw = nxt.group()
                     np = self._cached_pronunciations(nw)
-                    next_ipa = np[min(self._pron_index_cache.get(nw.lower(), 0), len(np) - 1)] if np else None
+                    next_ipa = np[min(self._preferred_index(nw.lower(), block.position() + nxt.start()), len(np) - 1)] if np else None
 
                 prons = self._context_aware_pronunciations(
                     word, None if has_punct_boundary else next_ipa)
                 if not prons:
                     continue
-                preferred = self._pron_index_cache.get(word_l, 0)
+                preferred = self._preferred_index(word_l, block.position() + m.start())
                 pron = prons[min(preferred, len(prons) - 1)]
                 # ── classify — single source of truth, shared with the word
                 #    detail panel and cheat-sheet export so all three agree
@@ -3224,6 +3299,7 @@ class MainWindow(QMainWindow):
 
         self._word_annotations = annotations
         self.editor.set_annotations(annotations)
+        self._update_missing_ipa_indicator()
 
     def _on_word_sustain_toggled(self, word_lower: str):
         sw = self.active_song.sustained_words
@@ -3241,9 +3317,12 @@ class MainWindow(QMainWindow):
     def _on_word_clicked(self, word, block_number, char_offset=-1):
         self._current_block_number = block_number
         line = self.editor.line_text(block_number)
+        self._current_char_offset = char_offset
+        abs_start = self._abs_offset(block_number, char_offset)
+        self._current_clicked_occ_key = self._occ_key(word.lower(), abs_start)
         next_ipa = self._get_next_word_ipa(line, word, char_offset)
         prons = self._context_aware_pronunciations(word, next_ipa)
-        preferred = self._pron_index_cache.get(word.lower(), 0)
+        preferred = self._preferred_index(word.lower(), abs_start)
         self.analysis.show_word(
             word, prons, initial_index=preferred, next_ipa=next_ipa,
             song_style=getattr(self.active_song, 'style', 'classical'),
@@ -3260,25 +3339,67 @@ class MainWindow(QMainWindow):
                 word, self.active_song.custom_ipa)
         return self._pron_cache[cache_key]
 
+    # ---- Per-occurrence pronunciation choice ----------------------------------
+    # A pronunciation choice belongs to a specific occurrence of a word, not to
+    # every copy of that word in the song. Occurrences are identified by
+    # "word#N" where N is the 0-based index of the occurrence among all matches
+    # of the same word across the whole lyrics. This is stable against edits
+    # elsewhere in the document (adding text before line 1 does not shift the
+    # occurrence index of a word unless you add another copy of that same word).
+
+    def _abs_offset(self, block_number: int, char_offset: int) -> int:
+        """Document position for a (block, in-block offset) pair, or -1."""
+        if block_number < 0 or char_offset < 0:
+            return -1
+        block = self.editor.document().findBlockByNumber(block_number)
+        if not block.isValid():
+            return -1
+        return block.position() + char_offset
+
+    def _occ_key(self, word_lower: str, abs_start: int) -> Optional[str]:
+        """Occurrence key 'word#N' for the word starting at *abs_start*."""
+        if abs_start is None or abs_start < 0:
+            return None
+        text = self.editor.toPlainText()
+        occ = sum(1 for m in WORD_RE.finditer(text)
+                  if m.group().lower() == word_lower and m.start() < abs_start)
+        return f'{word_lower}#{occ}'
+
+    def _preferred_index(self, word_lower: str, abs_start: int = -1) -> int:
+        """Preferred pronunciation index: per-occurrence choice first, then a
+        legacy word-level choice, else 0."""
+        pc = self._pron_index_cache
+        occ_key = self._occ_key(word_lower, abs_start)
+        if occ_key is not None and occ_key in pc:
+            return pc[occ_key]
+        if word_lower in pc:  # legacy / word-level default
+            return pc[word_lower]
+        return 0
+
     def _update_trajectory(self, line_text, clicked_offset: int = -1):
         items = []
         word_idx = 0
         clicked_word = self.analysis.word_label.text()
         clicked_word_idx = -1
         matches = list(WORD_RE.finditer(line_text))
+        block = self.editor.document().findBlockByNumber(self._current_block_number)
+        line_base = block.position() if block.isValid() else -1
         for i, m in enumerate(matches):
             w = m.group()
+            abs_start = (line_base + m.start()) if line_base >= 0 else -1
             # Next word's IPA for context-aware function-word resolution
             next_ipa = None
             if i + 1 < len(matches):
-                nw_word = matches[i + 1].group()
+                nxt = matches[i + 1]
+                nw_word = nxt.group()
                 np = self._cached_pronunciations(nw_word)
-                next_ipa = np[min(self._pron_index_cache.get(nw_word.lower(), 0), len(np) - 1)] if np else None
+                nxt_abs = (line_base + nxt.start()) if line_base >= 0 else -1
+                next_ipa = np[min(self._preferred_index(nw_word.lower(), nxt_abs), len(np) - 1)] if np else None
             prons = self._context_aware_pronunciations(w, next_ipa)
             if not prons:
                 word_idx += 1
                 continue
-            preferred_idx = self._pron_index_cache.get(w.lower(), 0)
+            preferred_idx = self._preferred_index(w.lower(), abs_start)
             pron = prons[min(preferred_idx, len(prons) - 1)]
             syls = find_syllable_vowels(pron)
             for sym, _, _ in syls:
@@ -3302,12 +3423,15 @@ class MainWindow(QMainWindow):
         so tʃ/dʒ are counted as one phone, not double- or triple-counted.
         """
         matches = list(WORD_RE.finditer(line_text))
+        block = self.editor.document().findBlockByNumber(self._current_block_number)
+        line_base = block.position() if block.isValid() else -1
         all_phones = []
         for m in matches:
             prons = self._cached_pronunciations(m.group())
             if not prons:
                 continue
-            preferred = self._pron_index_cache.get(m.group().lower(), 0)
+            abs_start = (line_base + m.start()) if line_base >= 0 else -1
+            preferred = self._preferred_index(m.group().lower(), abs_start)
             pron = prons[min(preferred, len(prons) - 1)]
             # Walk character by character; consume digraphs in one step
             i = 0
@@ -3384,7 +3508,8 @@ class MainWindow(QMainWindow):
                 running += 1
         self.trajectory.set_highlight(target)
 
-    def _play_vowel(self, sym):
+    def _resolve_audio(self, sym):
+        """Return the audio file path for *sym*, or None if none exists."""
         candidates = [sym]
         if sym in DIPHTHONGS:
             candidates.append(DIPHTHONGS[sym].primary)
@@ -3396,14 +3521,61 @@ class MainWindow(QMainWindow):
         for c in candidates:
             audio = self._resource_path(path.join('Audio', f'{c}.mp3'))
             if path.exists(audio):
-                self.player.setMedia(QMediaContent(QUrl.fromLocalFile(audio)))
-                self.player.play()
-                return
+                return audio
         if sym not in self._missing_audio_warned:
             self._missing_audio_warned.add(sym)
             print(f'Audio: no file found for /{sym}/ (tried: '
                   f'{[path.join("Audio", f"{c}.mp3") for c in candidates]})',
                   file=sys.stderr)
+        return None
+
+    def _play_vowel(self, sym):
+        # A single vowel play cancels any sequence currently in progress.
+        self._vowel_seq_active = False
+        audio = self._resolve_audio(sym)
+        if audio:
+            self.player.setMedia(QMediaContent(QUrl.fromLocalFile(audio)))
+            self.player.play()
+
+    # ---- Sequential vowel playback (Play line vowels) ----
+
+    def _play_line_vowels(self):
+        """Play every vowel in the current line in order, left to right."""
+        syms = [sym for sym, _ in self._current_line_items]
+        if not syms:
+            QMessageBox.information(
+                self, 'No Line Selected',
+                'Click a word in a line first, then play its vowels in sequence.')
+            return
+        self._vowel_seq = syms
+        self._vowel_seq_idx = 0
+        self._vowel_seq_active = True
+        self._play_seq_current()
+
+    def _play_seq_current(self):
+        if not self._vowel_seq_active:
+            return
+        if self._vowel_seq_idx >= len(self._vowel_seq):
+            self._vowel_seq_active = False
+            self.trajectory.set_highlight(-1)
+            return
+        sym = self._vowel_seq[self._vowel_seq_idx]
+        self.trajectory.set_highlight(self._vowel_seq_idx)
+        audio = self._resolve_audio(sym)
+        if audio:
+            self.player.setMedia(QMediaContent(QUrl.fromLocalFile(audio)))
+            self.player.play()
+        else:
+            # No audio for this vowel — skip straight to the next one.
+            self._advance_vowel_seq()
+
+    def _advance_vowel_seq(self):
+        self._vowel_seq_idx += 1
+        self._play_seq_current()
+
+    def _on_media_status(self, status):
+        if status == QMediaPlayer.EndOfMedia and self._vowel_seq_active:
+            self._seq_gap.start()  # brief pause, then advance
 
     @staticmethod
     def _resource_path(relative):
@@ -3436,7 +3608,9 @@ class MainWindow(QMainWindow):
         self._schedule_save()
         self._annotation_timer.start()
 
-    def _on_generate_prompt(self):
+    def _missing_ipa_words(self):
+        """Lowercase words in the lyrics with no usable IPA (not custom, not a
+        function word, and the dictionary returns nothing), preserving order."""
         lyrics = self.editor.toPlainText()
         seen = set()
         unknown = []
@@ -3453,6 +3627,43 @@ class MainWindow(QMainWindow):
             cleaned = [p for p in raw if p and '*' not in p]
             if not cleaned:
                 unknown.append(w)
+        return unknown
+
+    def _update_missing_ipa_indicator(self):
+        """Show/hide the lyrics-header badge that flags words lacking IPA."""
+        if not hasattr(self, 'missing_ipa_btn'):
+            return
+        n = len(self._missing_ipa_words())
+        if n:
+            self.missing_ipa_btn.setText(
+                f'⚠ {n} word needs IPA' if n == 1
+                else f'⚠ {n} words need IPA')
+            self.missing_ipa_btn.setVisible(True)
+        else:
+            self.missing_ipa_btn.setVisible(False)
+
+    def _on_check_missing_ipa(self):
+        """Report words with no IPA and offer to start the prompt → import flow."""
+        unknown = self._missing_ipa_words()
+        if not unknown:
+            QMessageBox.information(
+                self, 'IPA Check',
+                'Every word in this song resolves to an IPA pronunciation. '
+                'Nothing is missing.')
+            return
+        preview = ', '.join(unknown[:25]) + ('…' if len(unknown) > 25 else '')
+        resp = QMessageBox.question(
+            self, 'Missing IPA',
+            f'{len(unknown)} word(s) have no IPA pronunciation:\n\n{preview}\n\n'
+            'Generate an IPA prompt for these now? Paste it into an AI, then '
+            'use Song → Bulk Import IPAs… with the returned JSON.',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if resp == QMessageBox.Yes:
+            self._on_generate_prompt()
+
+    def _on_generate_prompt(self):
+        lyrics = self.editor.toPlainText()
+        unknown = self._missing_ipa_words()
 
         prompt = (
             "I'm singing the following song. Please provide an IPA "
@@ -3484,6 +3695,17 @@ class MainWindow(QMainWindow):
                 "a direction prompt.")
             return
 
+        # Optional: let the singer name their role/voice rather than forcing the
+        # AI to guess it (the guess is the riskiest part of the whole prompt).
+        role, ok = QInputDialog.getText(
+            self, 'Who are you singing?',
+            'Character or voice part you are singing (optional).\n'
+            'Leave blank to let the AI infer it from the lyrics.',
+            text='')
+        if not ok:
+            return
+        role = role.strip()
+
         name = self.active_song.name
         placeholder_names = {'Untitled', 'New Song'}
         if name in placeholder_names:
@@ -3502,98 +3724,146 @@ class MainWindow(QMainWindow):
 
         title_line = f'"{name}"' + (f' {title_note}' if title_note else '')
 
+        # Fold in the work I have already done in this app so the singing and
+        # phrasing advice is grounded in my actual choices, not generic rules.
+        song = self.active_song
+        present = song._present_words()
+        custom = {k: v for k, v in song.custom_ipa.items() if k in present}
+        sustained = sorted(w for w in song.sustained_words if w in present)
+        context_bits = []
+        if custom:
+            pairs = ', '.join(f'{w} = /{v}/' for w, v in sorted(custom.items()))
+            context_bits.append(
+                "Pronunciations I have already fixed for this song (treat these "
+                f"as given — do not re-transcribe them): {pairs}.")
+        if sustained:
+            context_bits.append(
+                "Words I am holding as sustained notes (long tones — your singing "
+                "and phrasing notes should give these particular attention): "
+                f"{', '.join(sustained)}.")
+        diction_context = ('\n\n' + '\n\n'.join(context_bits)) if context_bits else ''
+
+        # Step B varies depending on whether I named my role.
+        if role:
+            step_b = (
+                f"Step B — Character. I am singing: {role}. Confirm this against "
+                f"the score or libretto and attribute my lines accordingly. If "
+                f"the lyrics clearly do not fit that role, tell me before "
+                f"proceeding. All acting and singing direction below is for this "
+                f"role only.\n\n")
+        else:
+            step_b = (
+                "Step B — Character identification. From the lines provided, "
+                "determine which single character I am most likely playing. State "
+                "that character's name and explain your reasoning in one sentence. "
+                "All acting and singing direction below must be for that character "
+                "only. If you cannot determine which character I am playing, say "
+                "so and ask before proceeding.\n\n")
+
         prompt = (
             f"You are a vocal coach, stage director, and music scholar. "
-            f"I am preparing to sing the following song and need detailed "
-            f"research and performance direction. My broad singing discipline "
-            f"is {style_phrase}, but that is background context only — your "
-            f"advice must be grounded in the specific vocal tradition and "
-            f"casting conventions of this particular role and work, not in "
-            f"generic style rules.\n\n"
+            f"I am preparing to sing the song below and need research and "
+            f"performance direction. My broad singing discipline is "
+            f"{style_phrase}, but that is background only — ground your advice in "
+            f"the specific vocal tradition and casting conventions of this "
+            f"particular role and work.\n\n"
+            f"Accuracy matters more than completeness. Where you are not sure of "
+            f"a fact — the work's identity, a recording, a musical detail — say "
+            f"so plainly rather than inventing it, and use web search to verify "
+            f"where you can. I am still building my technical vocabulary, so "
+            f"briefly gloss any specialist term in plain language the first time "
+            f"you use it.\n\n"
             f"Song title: {title_line}\n\n"
-            f"Full lyrics:\n{lyrics}\n\n"
-            f"BEFORE YOU WRITE ANYTHING ELSE, do the following two steps and "
-            f"state your findings at the top of your response:\n\n"
-            f"Step A — Line attribution. Look up the score or libretto for "
-            f"this number using web search if you have access to it. Identify "
-            f"every character who sings in this number and label which lines "
-            f"belong to which character. Do not assume all lyrics are sung by "
-            f"a single character. If a line is shared, said in dialogue, or "
-            f"you cannot determine its speaker with confidence, flag it "
-            f"explicitly. Do not guess — an incorrect attribution will corrupt "
-            f"every section that follows.\n\n"
-            f"Step B — Character identification. From the lines provided, "
-            f"determine which single character I am most likely playing. State "
-            f"that character's name and explain your reasoning in one sentence. "
-            f"All acting and singing direction below must be for that character "
-            f"only. If you cannot determine which character I am playing, say "
-            f"so and ask before proceeding.\n\n"
-            f"With those two steps resolved, respond in plain prose with the "
-            f"seven section headers below. No JSON, no code fences, no markdown "
-            f"tables. Cite recordings and productions as performer + year + "
-            f"medium (cast album, film, broadcast). If a section genuinely does "
-            f"not apply, say so briefly rather than padding. If the title is "
-            f"ambiguous across multiple works, state which one the lyrics match "
-            f"and why.\n\n"
+            f"Lyrics (verbatim, between the markers):\n"
+            f"<lyrics>\n{lyrics}\n</lyrics>"
+            f"{diction_context}\n\n"
+            f"BEFORE YOU WRITE ANYTHING ELSE, do these two steps and state your "
+            f"findings at the top of your response:\n\n"
+            f"Step A — Line attribution. Look up the score or libretto for this "
+            f"number (web search if you can). Identify every character who sings "
+            f"in it and label which lines belong to whom. Do not assume all "
+            f"lyrics are sung by one character. If a line is shared, spoken, or "
+            f"you cannot determine its speaker with confidence, flag it. Do not "
+            f"guess — a wrong attribution corrupts everything that follows.\n\n"
+            f"{step_b}"
+            f"With those resolved, respond in plain prose under the numbered "
+            f"section headers below. No JSON, no code fences, no markdown tables. "
+            f"Cite recordings as performer + year + medium (cast album, film, "
+            f"broadcast), and only cite ones you are confident are real. If a "
+            f"section does not apply, say so briefly rather than padding.\n\n"
+            f"A note on the music: you have the lyrics, not the score. For "
+            f"well-known repertoire you may know the melody, rhythm, and dynamics "
+            f"or be able to look them up — use that. But only assert a specific "
+            f"musical fact (a high note, a belt, a held forte, the tessitura, a "
+            f"ritardando) when you can actually verify it from the score or a "
+            f"recording. When you are inferring from the words alone, say so and "
+            f"phrase it conditionally. Emphasis and stress that follow from the "
+            f"meaning of the text are always fair game.\n\n"
             f"1. Identification\n"
-            f"What work is this from (musical, opera, art song cycle, song "
-            f"book, standalone piece)? Name composer, lyricist, premiere year, "
-            f"and any version or edition notes that affect diction or key. If "
-            f"you are uncertain about any detail, say so.\n\n"
+            f"Name the work and confirm which character I am singing. Note an "
+            f"edition, key, or transposition only if it affects diction or which "
+            f"vowels land on which pitches. Keep this short — I do not need the "
+            f"composer's biography, premiere history, or production lineage. If "
+            f"you cannot identify the work with confidence, say so and stop "
+            f"rather than inventing context.\n\n"
             f"2. Dramatic Context\n"
-            f"Describe my character's situation: who they are singing to or "
-            f"about, where this number sits in the show or cycle, and what "
-            f"immediately precedes and follows it. For non-theatrical repertoire "
-            f"(art song, Lieder), substitute poetic context: poet, source poem "
-            f"or collection, and the speaker's situation.\n\n"
+            f"Briefly: my character's situation — who they are singing to or "
+            f"about, where this number sits in the show, and what immediately "
+            f"precedes and follows it. For art song or Lieder, give the poetic "
+            f"context instead: poet, source poem, and the speaker's situation.\n\n"
             f"3. Emotional Arc\n"
             f"Track how my character's inner state moves across the song. Mark "
             f"every turning point by the lyric phrase where it occurs — not by "
-            f"bar number. Be detailed enough that I can annotate a printed lyric "
+            f"bar number. Detailed enough that I can annotate a printed lyric "
             f"sheet.\n\n"
-            f"4. Acting Direction\n"
-            f"Give concrete, beat-by-beat acting notes for my character's lines "
-            f"only: where to lean in, where to pull back, what subtext shifts a "
-            f"line's reading, what physical stillness or gesture serves a moment. "
-            f"Avoid generic notes such as 'feel it deeply'. Anchor every note to "
-            f"a specific word or phrase.\n\n"
-            f"CRITICAL CONSTRAINT on Section 4: every acting note must be "
-            f"compatible with what the music physically demands at that moment. "
-            f"If the score calls for a belt, a sustained forte, or a climactic "
-            f"high note, do not direct me to pull back, go quiet, or make the "
-            f"moment smaller — that contradicts an irrevocable musical fact. "
-            f"Instead, show how my character's inner state justifies and fuels "
-            f"the vocal intensity the music requires. The acting serves the "
+            f"4. Phrasing and Expression\n"
+            f"Working phrase by phrase, suggest where to stress, lean, grow, and "
+            f"recede; which words carry the line; and where to breathe so the "
+            f"phrasing serves the sense. Derive emphasis and stress from the "
+            f"meaning of the text (always available to you). Tie dynamics and "
+            f"shaping to the actual music only where you can verify it — "
+            f"otherwise mark the suggestion as conditional per the note above.\n\n"
+            f"5. Acting Direction\n"
+            f"Concrete, beat-by-beat acting notes for my lines only: where to "
+            f"lean in, where to pull back, what subtext shifts a line's reading, "
+            f"what stillness or gesture serves a moment. No generic notes like "
+            f"'feel it deeply'. Anchor every note to a specific word or phrase.\n\n"
+            f"CRITICAL CONSTRAINT on Section 5: every acting note must be "
+            f"compatible with what the music as written demands at that moment "
+            f"(subject to the note above on verifying musical facts). If the "
+            f"music calls for a belt, a sustained forte, or a climactic high "
+            f"note, do not direct me to pull back, go quiet, or make the moment "
+            f"smaller. Instead, show how my character's inner state justifies and "
+            f"fuels the vocal intensity the music requires. The acting serves the "
             f"music; it does not override it.\n\n"
-            f"5. Singing Direction\n"
-            f"Research the specific vocal tradition for this role: how has it "
-            f"been cast and coached, what technique do authoritative productions "
-            f"and recordings use, what is the expected vocal colour and weight. "
-            f"Give advice grounded in that role-specific tradition — not in "
-            f"generic {style_phrase} rules. Name the technique or approach "
-            f"explicitly (for example: mix-belt at the break, legato sostenuto "
-            f"through the phrase, speech-quality onset on the verse). Address "
-            f"breath strategy on long phrases and any vowel modification the "
-            f"tessitura demands.\n\n"
-            f"6. Tradition and Interpretation\n"
+            f"6. Singing Direction\n"
+            f"Research the specific vocal tradition for this role: how it has "
+            f"been cast and coached, what technique authoritative productions and "
+            f"recordings use, the expected vocal colour and weight. Name the "
+            f"technique explicitly (for example: mix-belt at the break, legato "
+            f"sostenuto through the phrase, speech-quality onset on the verse), "
+            f"glossing each. Address breath strategy on long phrases and any "
+            f"vowel modification the tessitura demands. Where I have marked "
+            f"sustained words or fixed pronunciations above, build your advice "
+            f"around those.\n\n"
+            f"7. Tradition and Interpretation\n"
             f"Describe well-known recordings or stage interpretations and how "
-            f"they differ. Note where the standard reading has been challenged "
-            f"or where multiple defensible interpretations coexist. Name "
-            f"specific singers and productions.\n\n"
-            f"7. Pitfalls\n"
-            f"List common mistakes specific to this song and this role — rushed "
-            f"phrases, misplaced emphases, vowel traps, clichéd dramatic choices. "
-            f"For each pitfall, name the word or line, explain why the mistake "
-            f"happens, and say what to do instead."
+            f"they differ, naming specific singers and productions you are "
+            f"confident are real. Note where the standard reading has been "
+            f"challenged or where multiple defensible readings coexist.\n\n"
+            f"8. Pitfalls\n"
+            f"Common mistakes specific to this song and role — rushed phrases, "
+            f"misplaced emphases, vowel traps, clichéd dramatic choices. For each, "
+            f"name the word or line, say why the mistake happens, and what to do "
+            f"instead."
         )
 
         QApplication.clipboard().setText(prompt)
         QMessageBox.information(
             self, 'Direction Prompt Copied',
-            "A research and direction prompt for "
-            f'"{name}" has been copied to your clipboard.\n\n'
-            "Paste it into an AI assistant and read the prose it returns. "
-            "This output is for your own study — it is not in a format "
+            "A research and direction prompt has been copied to your "
+            "clipboard.\n\nPaste it into an AI assistant and read the prose it "
+            "returns. This output is for your own study — it is not in a format "
             "for Song \u2192 Bulk Import IPAs.")
 
     def _on_open_save_folder(self):
@@ -3642,12 +3912,14 @@ class MainWindow(QMainWindow):
         self._update_hints_btn_label()
 
 
-    def _line_to_ipa(self, line_text: str) -> str:
+    def _line_to_ipa(self, line_text: str, line_base: int = -1) -> str:
         """Render a line of lyrics as IPA, preserving punctuation and spacing.
 
         Uses the same context-aware pronunciation logic as the trajectory bar
         (function-word reductions, custom IPA overrides, and the user's
-        preferred-pronunciation choice per word).
+        preferred-pronunciation choice per occurrence). *line_base* is the
+        absolute offset of this line within the full lyrics; when given, the
+        user's per-occurrence pronunciation choices are honoured.
         """
         matches = list(WORD_RE.finditer(line_text))
         if not matches:
@@ -3658,17 +3930,19 @@ class MainWindow(QMainWindow):
             parts.append(line_text[last_end:m.start()])
             w = m.group()
             wl = w.lower()
+            abs_start = (line_base + m.start()) if line_base >= 0 else -1
             # Next word's IPA for the/to vowel-vs-consonant resolution
             next_ipa = None
             if i + 1 < len(matches):
-                nw = matches[i + 1].group()
-                np = self._cached_pronunciations(nw)
+                nxt = matches[i + 1]
+                np = self._cached_pronunciations(nxt.group())
                 if np:
-                    idx = self._pron_index_cache.get(nw.lower(), 0)
+                    nxt_abs = (line_base + nxt.start()) if line_base >= 0 else -1
+                    idx = self._preferred_index(nxt.group().lower(), nxt_abs)
                     next_ipa = np[min(idx, len(np) - 1)]
             prons = self._context_aware_pronunciations(w, next_ipa)
             if prons:
-                preferred = self._pron_index_cache.get(wl, 0)
+                preferred = self._preferred_index(wl, abs_start)
                 pron = prons[min(preferred, len(prons) - 1)]
                 parts.append(f'/{pron}/')
             else:
@@ -3691,11 +3965,13 @@ class MainWindow(QMainWindow):
         song = self.active_song
 
         lyric_blocks = []
+        line_base = 0
         for raw_line in song.lyrics.splitlines():
             if raw_line.strip():
-                lyric_blocks.append((raw_line, self._line_to_ipa(raw_line)))
+                lyric_blocks.append((raw_line, self._line_to_ipa(raw_line, line_base)))
             else:
                 lyric_blocks.append(('', ''))
+            line_base += len(raw_line) + 1  # +1 for the newline separator
 
         word_entries = []
         seen = set()
@@ -3761,6 +4037,9 @@ class MainWindow(QMainWindow):
     def _on_export_cheat_sheet(self, fmt: str):
         # Flush any pending annotation recompute so the tips are current (Bug 7 fix).
         self._annotation_timer.stop()
+        # Keep song.lyrics in step with the editor so occurrence-based
+        # pronunciation choices line up with what is being exported.
+        self.active_song.lyrics = self.editor.toPlainText()
         self._compute_annotations()
         from PyQt5.QtWidgets import QFileDialog
         name_safe = re.sub(r'[^\w\s-]', '', self.active_song.name).strip() or 'song'
@@ -3970,13 +4249,52 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _resource_base() -> str:
+    """Directory holding bundled resources (PyInstaller _MEIPASS or script dir)."""
+    return getattr(sys, '_MEIPASS', path.dirname(path.abspath(__file__)))
+
+
+def _app_icon() -> QIcon:
+    """Locate the application icon PNG and return a QIcon.
+
+    Looks for common names first, then falls back to the first *.png sitting
+    next to the executable / script. Rename your icon to one of the preferred
+    names (icon.png) to be safe, or drop it in the same folder as the exe.
+    """
+    base = _resource_base()
+    preferred = ('icon.png', 'app.png', 'LyricsToIPA.png', 'logo.png')
+    for name in preferred:
+        p = path.join(base, name)
+        if path.exists(p):
+            return QIcon(p)
+    try:
+        for name in sorted(os.listdir(base)):
+            if name.lower().endswith('.png'):
+                return QIcon(path.join(base, name))
+    except OSError:
+        pass
+    return QIcon()
+
+
 def main():
     # ── HiDPI flags must come before QApplication() ───────────────────────────
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
+    # On Windows, set an explicit AppUserModelID so the taskbar shows our icon
+    # and groups the window under this app rather than the python launcher.
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                'Heng.LyricsToIPA.1')
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
+    app.setApplicationName('Lyric IPA Finder')
     app.setStyle('Fusion')
+    app.setWindowIcon(_app_icon())
     pal = QPalette()
     pal.setColor(QPalette.Window, QColor('#14181f'))
     pal.setColor(QPalette.WindowText, QColor('#d8dfe8'))
