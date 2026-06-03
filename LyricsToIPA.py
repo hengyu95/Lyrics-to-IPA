@@ -596,7 +596,8 @@ def consonant_release_tip(consonants: list) -> str:
         lines.append(f'Plosive exit ({s}) — snap off instantly. No shadow vowel after it.')
     if nasals:
         s = ' '.join(f'/{c}/' for c in nasals)
-        lines.append(f'Nasal exit ({s}) — carries pitch; sustain through it before releasing.')
+        lines.append(f'Nasal exit ({s}) — sustain the vowel; place the nasal late and short. '
+                     f'It can carry pitch briefly into the release, but don\'t dwell on it.')
     if approx:
         for c in approx:
             if c == 'l':
@@ -756,22 +757,153 @@ def _check_h_aspiration(pron: str) -> Optional[str]:
     return None
 
 
+# Every non-onset tip type compute_word_tips can emit. Used as the default
+# "all hints on" set for call sites (e.g. auxiliary panels) that don't carry
+# the user's live hint toggles.
+ALL_HINT_TYPES = frozenset({
+    'legato', 'vowel_glide', 'crash', 'r_toxicity', 'dark_l',
+    'plosive', 'nasal', 'approx', 'fricative',
+    'yod', 'ng_release', 'diphthong', 'aspiration',
+})
 
+
+def compute_word_tips(pron, next_ipa, has_punct_boundary, song_style, enabled):
+    """Single source of truth for a word's diction tips.
+
+    Returns an ordered list of (tip_type, tip_text). The first entry is the
+    primary boundary/exit tip; any remaining entries are supplementary notes
+    that stack on top of it (r-toxicity, yod, /ŋ/, spurious diphthong, /h/).
+
+    An empty list means no primary tip fired — the caller may choose to show a
+    phrase-initial glottal/onset note instead. Both the inline lyric
+    annotations (and therefore the cheat-sheet export) and the click-to-view
+    word detail panel route through this function so all three views agree.
+    """
+    if enabled is None:
+        enabled = ALL_HINT_TYPES
+
+    trailing  = ipa_trailing_consonants(pron)
+    end_vowel = ipa_ends_with_vowel(pron)
+    nlv = ipa_leading_vowel(next_ipa) if (next_ipa and not has_punct_boundary) else None
+    nlc = ipa_leading_consonant(next_ipa) if (next_ipa and not has_punct_boundary) else None
+    plosives   = [c for c in trailing if c in IPA_PLOSIVES]
+    nasals     = [c for c in trailing if c in IPA_NASALS]
+    approx     = [c for c in trailing if c in IPA_APPROXIMANTS]
+    rhotics    = [c for c in trailing if c in IPA_RHOTIC]
+    fricatives = [c for c in trailing if c in IPA_FRICATIVES]
+    has_rhotic_vowel = any(s in ('ɚ', 'ɝ') for s, _, _ in find_syllable_vowels(pron))
+
+    tip_type = tip = None
+    r_tip = None  # may stack with the primary boundary tip
+
+    # 1. Legato (consonant end -> next vowel start, no punct)
+    if trailing and nlv is not None:
+        cd = ' '.join(f'/{c}/' for c in trailing)
+        tip = (f'Legato — carry {cd} into the opening /{nlv}/ '
+               f'of the next word. Keep the breath connected.')
+        tip_type = 'legato'
+    # 2. Vowel-to-vowel glide (word ends on vowel, next starts vowel)
+    elif end_vowel is not None and nlv is not None:
+        glide = '/j/' if end_vowel in _GLIDE_J else '/w/'
+        tip = (f'Vowel-to-vowel — insert a soft {glide} glide to avoid '
+               f'a glottal stop before /{nlv}/. Keep airflow open.')
+        tip_type = 'vowel_glide'
+    # 3. Consonant crash
+    elif trailing and nlc is not None:
+        crash = consonant_crash_tip(trailing, nlc)
+        if crash:
+            tip, tip_type = crash, 'crash'
+
+    # 4. R toxicity — stacks with the boundary tip; becomes primary if none yet
+    if (rhotics or has_rhotic_vowel) and 'r_toxicity' in enabled:
+        r_tip = ('American R — de-rhotacize: release the tongue curl/bunch '
+                 'before the note sustains. Sustain on the base vowel '
+                 '(ə or ɜ) instead of the r-colored form.')
+        if tip_type is None:
+            tip = r_tip
+            tip_type = 'r_toxicity'
+            r_tip = None
+
+    # 5. Dark L — trailing /l/ not already captured; skipped in MT/CCM
+    if tip_type is None and trailing and trailing[-1] == 'l' and song_style != 'mt_ccm':
+        tip = ('Dark L exit \u2014 keep the tongue tip on the alveolar '
+               'ridge. Do not pull the tongue root back; that '
+               'swallows the resonance and darkens the sound.')
+        tip_type = 'dark_l'
+
+    # 6. Consonant exit fallback (no boundary interaction found above)
+    if tip_type is None:
+        if plosives:
+            s = ' '.join(f'/{c}/' for c in plosives)
+            tip = f'Plosive exit {s} — snap off cleanly, no shadow vowel.'
+            tip_type = 'plosive'
+        elif nasals:
+            s = ' '.join(f'/{c}/' for c in nasals)
+            tip = f'Nasal exit {s} — sustain the vowel; place the nasal late and short.'
+            tip_type = 'nasal'
+        elif approx and not rhotics:
+            s = ' '.join(f'/{c}/' for c in approx)
+            tip = f'Approximant exit {s} — gentle release, no hard cutoff.'
+            tip_type = 'approx'
+        elif fricatives:
+            s = ' '.join(f'/{c}/' for c in fricatives)
+            tip = f'Fricative exit {s} — control the airstream.'
+            tip_type = 'fricative'
+
+    # No primary tip (or its type is disabled) -> caller may show glottal onset.
+    # Matches the engine: supplementary tips only stack on top of a primary.
+    if tip_type is None or tip_type not in enabled:
+        return []
+
+    out = [(tip_type, tip)]
+    if r_tip:
+        out.append(('r_toxicity', r_tip))
+
+    # 7. Supplementary word-level tips (stack freely with the boundary tip)
+    if 'yod' in enabled:
+        yod = _check_yod_coalescence(pron, next_ipa)
+        if yod:
+            out.append(('yod', yod))
+    if 'ng_release' in enabled:
+        ng = _check_ng_release(pron)
+        if ng:
+            out.append(('ng_release', ng))
+    if 'diphthong' in enabled:
+        dt = _check_spurious_diphthong(pron)
+        if dt:
+            out.append(('diphthong', dt))
+    if 'aspiration' in enabled:
+        asp = _check_h_aspiration(pron)
+        if asp:
+            out.append(('aspiration', asp))
+    return out
+
+
+# Background tints — the PRIMARY at-a-glance signal. The earlier tints were
+# near-black and barely separated from the editor's dark navy (#1c2230). Each
+# type now has its own shade, but shades are grouped into three hue bands so the
+# *family* still reads instantly across the page while individual types remain
+# distinguishable up close. All stay dark enough that the light text (#d8dfe8)
+# is readable on top (contrast >= 4:1).
+#   caution/avoid -> wine-red band  ·  release/exit -> teal band  ·  transition -> amber band
 ANN_BG = {
-    'legato':      '#3a3220',
-    'vowel_glide': '#1e2e1e',
-    'crash':       '#3a2820',
-    'r_toxicity':  '#3a1e1e',
-    'dark_l':      '#2a3040',
-    'glottal':     '#2a2a40',
-    'plosive':     '#3a2830',
-    'nasal':       '#1a2e28',
-    'approx':      '#1a2838',
-    'fricative':   '#281a36',
-    'yod':         '#2e2a18',
-    'ng_release':  '#1a2e20',
-    'diphthong':   '#301a2a',
-    'aspiration':  '#1e2830',
+    # caution / things to avoid  — wine-red band
+    'r_toxicity':  '#751f2a',   # boldest red — strongest warning
+    'crash':       '#7c2d32',
+    'glottal':     '#722c43',
+    'aspiration':  '#763a2e',
+    'dark_l':      '#562e36',
+    # consonant release / exit  — teal band
+    'ng_release':  '#1c594d',
+    'plosive':     '#24655f',
+    'nasal':       '#2c6d57',
+    'fricative':   '#295d65',
+    'approx':      '#2f6a4b',
+    # transition / glide / link  — amber band
+    'yod':         '#5b4725',
+    'legato':      '#6f571f',
+    'diphthong':   '#744a25',
+    'vowel_glide': '#776928',
 }
 # Foreground underline colors
 ANN_COLOR = {
@@ -791,6 +923,30 @@ ANN_COLOR = {
     'aspiration':  '#78a8c8',
 }
 
+
+# Underline *style* per tip family. Color alone is hard to read at a glance
+# (several categories share a red/orange hue), so the line shape encodes the
+# pedagogical intent: wavy = caution/avoid, dotted = consonant release/exit,
+# dashed = transition/glide/link. Color then disambiguates within a family.
+ANN_UNDERLINE_STYLE = {
+    # caution / things to avoid -> wavy
+    'r_toxicity':  QTextCharFormat.WaveUnderline,
+    'crash':       QTextCharFormat.WaveUnderline,
+    'glottal':     QTextCharFormat.WaveUnderline,
+    'aspiration':  QTextCharFormat.WaveUnderline,
+    'dark_l':      QTextCharFormat.WaveUnderline,
+    # consonant release / exit -> dotted
+    'plosive':     QTextCharFormat.DotLine,
+    'nasal':       QTextCharFormat.DotLine,
+    'fricative':   QTextCharFormat.DotLine,
+    'approx':      QTextCharFormat.DotLine,
+    'ng_release':  QTextCharFormat.DotLine,
+    # transition / glide / link -> dashed
+    'legato':      QTextCharFormat.DashUnderline,
+    'vowel_glide': QTextCharFormat.DashUnderline,
+    'diphthong':   QTextCharFormat.DashUnderline,
+    'yod':         QTextCharFormat.DashUnderline,
+}
 
 # Module-level cache for plain dictionary lookups (no custom IPA).
 # Custom IPA is layered on top in get_pronunciations().
@@ -1468,7 +1624,8 @@ class LyricsEditor(QTextEdit):
             cur.setPosition(a.abs_end, QTextCursor.KeepAnchor)
             fmt = QTextCharFormat()
             fmt.setBackground(QColor(a.bg_color))
-            fmt.setUnderlineStyle(QTextCharFormat.SingleUnderline)
+            fmt.setUnderlineStyle(
+                ANN_UNDERLINE_STYLE.get(a.tip_type, QTextCharFormat.SingleUnderline))
             fmt.setUnderlineColor(QColor(a.color))
             sel = QTextEdit.ExtraSelection()
             sel.cursor = cur
@@ -2035,11 +2192,15 @@ class AnalysisPanel(QWidget):
         layout.addWidget(self.card)
         layout.addWidget(self.play_btn)
 
-    def show_word(self, word, pronunciations, initial_index=0, next_ipa=None):
+    def show_word(self, word, pronunciations, initial_index=0, next_ipa=None,
+                  song_style='classical', enabled_hints=None, has_punct_boundary=False):
         self._pronunciations = pronunciations
         self._current_pron_index = 0
         self._current_word = word
         self._next_ipa = next_ipa
+        self._song_style = song_style
+        self._enabled_hints = enabled_hints
+        self._has_punct_boundary = has_punct_boundary
         self.word_label.setText(word)
         self.speak_btn.setEnabled(bool(word and word != 'Click a word to begin'))
 
@@ -2167,40 +2328,20 @@ class AnalysisPanel(QWidget):
             self.vowel_selected.emit(index)
 
     def _update_word_tips(self, pron: str):
-        """Refresh the panel tips using the same priority logic as inline annotations,
-        so the text in the panel matches the hover tooltip on the word.
+        """Refresh the panel tips from the shared tip engine, so the panel, the
+        hover tooltip, and the cheat-sheet export all show the same advice.
+        The primary boundary tip goes in the top label; any stacked notes
+        (r-toxicity, /ŋ/, yod, spurious diphthong, /h/) go in the second.
         """
-        trailing  = ipa_trailing_consonants(pron)
-        end_vowel = ipa_ends_with_vowel(pron)
-        next_ipa  = self._next_ipa
+        tips = compute_word_tips(
+            pron, self._next_ipa,
+            getattr(self, '_has_punct_boundary', False),
+            getattr(self, '_song_style', 'classical'),
+            getattr(self, '_enabled_hints', None))
 
-        next_leading_v = ipa_leading_vowel(next_ipa) if next_ipa else None
-        next_leading_c = ipa_leading_consonant(next_ipa) if next_ipa else None
-        rhotics   = [c for c in trailing if c in IPA_RHOTIC]
-        has_rhotic_vowel = any(s in ('ɚ', 'ɝ') for s, _, _ in find_syllable_vowels(pron))
-
-        legato_text = cons_text = ''
-
-        # Priority mirrors _compute_annotations exactly
-        if trailing and next_leading_v is not None:
-            cd = ' '.join(f'/{c}/' for c in trailing)
-            legato_text = (f'Legato \u2014 carry {cd} into the opening /{next_leading_v}/ '
-                           f'of the next word. Keep the breath connected.')
-        elif end_vowel is not None and next_leading_v is not None:
-            glide = '/j/' if end_vowel in _GLIDE_J else '/w/'
-            legato_text = (f'Vowel-to-vowel \u2014 insert a soft {glide} glide to avoid '
-                           f'a glottal stop before /{next_leading_v}/. Keep airflow open.')
-        elif trailing and next_leading_c is not None:
-            crash = consonant_crash_tip(trailing, next_leading_c)
-            if crash:
-                legato_text = crash
-
-        # Consonant / rhotic tip (secondary)
-        if rhotics or has_rhotic_vowel:
-            cons_text = ('American R \u2014 de-rhotacize: release the tongue curl/bunch. '
-                         'Sustain on \u0259 or \u025c instead.')
-        elif trailing:
-            cons_text = consonant_release_tip(trailing)
+        boundary = {'legato', 'vowel_glide', 'crash'}
+        legato_text = next((txt for tt, txt in tips if tt in boundary), '')
+        cons_text = '\n\n'.join(txt for tt, txt in tips if tt not in boundary)
 
         self.legato_tip.setText(legato_text)
         self.legato_tip.setVisible(bool(legato_text))
@@ -3057,173 +3198,29 @@ class MainWindow(QMainWindow):
                     continue
                 preferred = self._pron_index_cache.get(word_l, 0)
                 pron = prons[min(preferred, len(prons) - 1)]
-                trailing  = ipa_trailing_consonants(pron)
-                end_vowel = ipa_ends_with_vowel(pron)
+                # ── classify — single source of truth, shared with the word
+                #    detail panel and cheat-sheet export so all three agree
+                tips = compute_word_tips(
+                    pron, next_ipa, has_punct_boundary,
+                    song_style, self._enabled_hint_types)
 
-                # ── classify ──────────────────────────────────────────────────
-                next_leading_v = (ipa_leading_vowel(next_ipa)
-                                  if next_ipa and not has_punct_boundary else None)
-                next_leading_c = (ipa_leading_consonant(next_ipa)
-                                  if next_ipa and not has_punct_boundary else None)
-                plosives   = [c for c in trailing if c in IPA_PLOSIVES]
-                nasals     = [c for c in trailing if c in IPA_NASALS]
-                approx     = [c for c in trailing if c in IPA_APPROXIMANTS]
-                rhotics    = [c for c in trailing if c in IPA_RHOTIC]
-                fricatives = [c for c in trailing if c in IPA_FRICATIVES]
-
-                # R-colored vowels count as rhotic even without trailing /r/
-                has_rhotic_vowel = any(
-                    s in ('ɚ', 'ɝ') for s, _, _ in find_syllable_vowels(pron))
-
-                tip_type = tip = None
-                r_tip = None  # may stack with boundary tip (see below)
-
-                # 1. Legato (consonant end → next vowel start, no punct)
-                if trailing and next_leading_v is not None:
-                    cd = ' '.join(f'/{c}/' for c in trailing)
-                    tip = (f'Legato — carry {cd} into the opening /{next_leading_v}/ '
-                           f'of the next word. Keep the breath connected.')
-                    tip_type = 'legato'
-
-                # 2. Vowel-to-vowel glide (word ends on vowel, next starts vowel)
-                elif end_vowel is not None and next_leading_v is not None:
-                    glide = '/j/' if end_vowel in _GLIDE_J else '/w/'
-                    tip = (f'Vowel-to-vowel — insert a soft {glide} glide to avoid '
-                           f'a glottal stop before /{next_leading_v}/. Keep airflow open.')
-                    tip_type = 'vowel_glide'
-
-                # 3. Consonant crash
-                elif trailing and next_leading_c is not None:
-                    crash = consonant_crash_tip(trailing, next_leading_c)
-                    if crash:
-                        tip, tip_type = crash, 'crash'
-
-                # 4. R toxicity — stacks with boundary tips (legato/crash/glide)
-                #    A word like "her" before "answer" is doubly problematic: the
-                #    singer needs both the boundary note and the R-release note.
-                if (rhotics or has_rhotic_vowel) and 'r_toxicity' in self._enabled_hint_types:
-                    r_tip = ('American R — de-rhotacize: release the tongue curl/bunch '
-                             'before the note sustains. Sustain on the base vowel '
-                             '(ə or ɜ) instead of the r-colored form.')
-                    if tip_type is None:
-                        tip = r_tip
-                        tip_type = 'r_toxicity'
-                        r_tip = None  # will be emitted as the primary tip below
-
-                # 5. Dark L — trailing /l/ not already captured as legato/crash
-                #    Skipped in MT/CCM where dark-L is often stylistically neutral
-                if tip_type is None and trailing and trailing[-1] == 'l' and song_style != 'mt_ccm':
-                    tip = ('Dark L exit \u2014 keep the tongue tip on the alveolar '
-                           'ridge. Do not pull the tongue root back; that '
-                           'swallows the resonance and darkens the sound.')
-                    tip_type = 'dark_l'
-
-                # 6. Consonant exit tips (no boundary interaction found above)
-                if tip_type is None:
-                    if plosives:
-                        s = ' '.join(f'/{c}/' for c in plosives)
-                        tip = f'Plosive exit {s} — snap off cleanly, no shadow vowel.'
-                        tip_type = 'plosive'
-                    elif nasals:
-                        s = ' '.join(f'/{c}/' for c in nasals)
-                        tip = f'Nasal exit {s} — carries pitch; sustain through it.'
-                        tip_type = 'nasal'
-                    elif approx and not rhotics:
-                        s = ' '.join(f'/{c}/' for c in approx)
-                        tip = f'Approximant exit {s} — gentle release, no hard cutoff.'
-                        tip_type = 'approx'
-                    elif fricatives:
-                        s = ' '.join(f'/{c}/' for c in fricatives)
-                        tip = f'Fricative exit {s} — control the airstream.'
-                        tip_type = 'fricative'
-
-                if tip_type is None or tip_type not in self._enabled_hint_types:
-                    # No regular tip — emit glottal annotation if one was pending
+                if not tips:
+                    # No regular tip — emit the pending glottal onset note if any
                     if glottal_annotation:
                         annotations.append(glottal_annotation)
                     continue
 
-                # Regular tip fires on this range — skip glottal to avoid overlap
-
-                annotations.append(WordAnnotation(
-                    word=word, word_lower=word_l,
-                    block=block_num, start=m.start(), end=m.end(),
-                    abs_start=block.position() + m.start(),
-                    abs_end=block.position() + m.end(),
-                    tip_type=tip_type, tip_text=tip,
-                    color=ANN_COLOR[tip_type],
-                    bg_color=ANN_BG[tip_type],
-                ))
-
-                # Stacked r_toxicity annotation (boundary tip already appended above)
-                if r_tip:
+                # Regular tip(s) fire on this range — skip glottal to avoid overlap
+                for tt, txt in tips:
                     annotations.append(WordAnnotation(
                         word=word, word_lower=word_l,
                         block=block_num, start=m.start(), end=m.end(),
                         abs_start=block.position() + m.start(),
                         abs_end=block.position() + m.end(),
-                        tip_type='r_toxicity', tip_text=r_tip,
-                        color=ANN_COLOR['r_toxicity'],
-                        bg_color=ANN_BG['r_toxicity'],
+                        tip_type=tt, tip_text=txt,
+                        color=ANN_COLOR[tt],
+                        bg_color=ANN_BG[tt],
                     ))
-
-                # 7. Supplementary word-level tips (stack freely with boundary tips)
-
-                # Yod-coalescence (/d/ or /t/ before next /j/)
-                if 'yod' in self._enabled_hint_types:
-                    yod = _check_yod_coalescence(pron, next_ipa)
-                    if yod:
-                        annotations.append(WordAnnotation(
-                            word=word, word_lower=word_l,
-                            block=block_num, start=m.start(), end=m.end(),
-                            abs_start=block.position() + m.start(),
-                            abs_end=block.position() + m.end(),
-                            tip_type='yod', tip_text=yod,
-                            color=ANN_COLOR['yod'],
-                            bg_color=ANN_BG['yod'],
-                        ))
-
-                # /ŋ/ release — no /g/ tail
-                if 'ng_release' in self._enabled_hint_types:
-                    ng = _check_ng_release(pron)
-                    if ng:
-                        annotations.append(WordAnnotation(
-                            word=word, word_lower=word_l,
-                            block=block_num, start=m.start(), end=m.end(),
-                            abs_start=block.position() + m.start(),
-                            abs_end=block.position() + m.end(),
-                            tip_type='ng_release', tip_text=ng,
-                            color=ANN_COLOR['ng_release'],
-                            bg_color=ANN_BG['ng_release'],
-                        ))
-
-                # Spurious diphthongization on monophthong vowels
-                if 'diphthong' in self._enabled_hint_types:
-                    dt = _check_spurious_diphthong(pron)
-                    if dt:
-                        annotations.append(WordAnnotation(
-                            word=word, word_lower=word_l,
-                            block=block_num, start=m.start(), end=m.end(),
-                            abs_start=block.position() + m.start(),
-                            abs_end=block.position() + m.end(),
-                            tip_type='diphthong', tip_text=dt,
-                            color=ANN_COLOR['diphthong'],
-                            bg_color=ANN_BG['diphthong'],
-                        ))
-
-                # /h/ aspiration at high pitch
-                if 'aspiration' in self._enabled_hint_types:
-                    asp = _check_h_aspiration(pron)
-                    if asp:
-                        annotations.append(WordAnnotation(
-                            word=word, word_lower=word_l,
-                            block=block_num, start=m.start(), end=m.end(),
-                            abs_start=block.position() + m.start(),
-                            abs_end=block.position() + m.end(),
-                            tip_type='aspiration', tip_text=asp,
-                            color=ANN_COLOR['aspiration'],
-                            bg_color=ANN_BG['aspiration'],
-                        ))
 
         self._word_annotations = annotations
         self.editor.set_annotations(annotations)
@@ -3247,7 +3244,10 @@ class MainWindow(QMainWindow):
         next_ipa = self._get_next_word_ipa(line, word, char_offset)
         prons = self._context_aware_pronunciations(word, next_ipa)
         preferred = self._pron_index_cache.get(word.lower(), 0)
-        self.analysis.show_word(word, prons, initial_index=preferred, next_ipa=next_ipa)
+        self.analysis.show_word(
+            word, prons, initial_index=preferred, next_ipa=next_ipa,
+            song_style=getattr(self.active_song, 'style', 'classical'),
+            enabled_hints=self._enabled_hint_types)
         self.analysis._show_sustained_tips(
             word.lower() in self.active_song.sustained_words,
             self.analysis._current_vowel)
@@ -3505,71 +3505,86 @@ class MainWindow(QMainWindow):
         prompt = (
             f"You are a vocal coach, stage director, and music scholar. "
             f"I am preparing to sing the following song and need detailed "
-            f"research and performance direction. The declared singing style "
-            f"is: {style_phrase}.\n\n"
+            f"research and performance direction. My broad singing discipline "
+            f"is {style_phrase}, but that is background context only — your "
+            f"advice must be grounded in the specific vocal tradition and "
+            f"casting conventions of this particular role and work, not in "
+            f"generic style rules.\n\n"
             f"Song title: {title_line}\n\n"
             f"Full lyrics:\n{lyrics}\n\n"
-            f"Please respond in plain prose with the seven section headers "
-            f"listed below. No JSON, no code fences, no markdown tables. "
-            f"Where you cite a recording or production, give performer + year "
-            f"+ medium (cast album, film, broadcast). If a section genuinely "
-            f"does not apply to this song, say so briefly rather than padding. "
-            f"Cross-check the title — if it is ambiguous or appears in multiple "
-            f"works, state which one the lyrics match and explain why.\n\n"
+            f"BEFORE YOU WRITE ANYTHING ELSE, do the following two steps and "
+            f"state your findings at the top of your response:\n\n"
+            f"Step A — Line attribution. Look up the score or libretto for "
+            f"this number using web search if you have access to it. Identify "
+            f"every character who sings in this number and label which lines "
+            f"belong to which character. Do not assume all lyrics are sung by "
+            f"a single character. If a line is shared, said in dialogue, or "
+            f"you cannot determine its speaker with confidence, flag it "
+            f"explicitly. Do not guess — an incorrect attribution will corrupt "
+            f"every section that follows.\n\n"
+            f"Step B — Character identification. From the lines provided, "
+            f"determine which single character I am most likely playing. State "
+            f"that character's name and explain your reasoning in one sentence. "
+            f"All acting and singing direction below must be for that character "
+            f"only. If you cannot determine which character I am playing, say "
+            f"so and ask before proceeding.\n\n"
+            f"With those two steps resolved, respond in plain prose with the "
+            f"seven section headers below. No JSON, no code fences, no markdown "
+            f"tables. Cite recordings and productions as performer + year + "
+            f"medium (cast album, film, broadcast). If a section genuinely does "
+            f"not apply, say so briefly rather than padding. If the title is "
+            f"ambiguous across multiple works, state which one the lyrics match "
+            f"and why.\n\n"
             f"1. Identification\n"
-            f"What work is this song from (musical, opera, art song cycle, song "
-            f"book, or standalone piece)? Name the composer and lyricist, the "
-            f"premiere year, and any version or edition notes that matter for "
-            f"diction or key. If you are uncertain about any detail, say so "
-            f"rather than guessing.\n\n"
+            f"What work is this from (musical, opera, art song cycle, song "
+            f"book, standalone piece)? Name composer, lyricist, premiere year, "
+            f"and any version or edition notes that affect diction or key. If "
+            f"you are uncertain about any detail, say so.\n\n"
             f"2. Dramatic Context\n"
-            f"Who is the character singing, and to whom or about whom are they "
-            f"singing? Where does this number sit in the show or cycle — what "
-            f"immediately precedes and follows it? For non-theatrical repertoire "
-            f"(art song, Lieder), substitute poetic context: name the poet, the "
-            f"source poem or collection, and describe the speaker's situation.\n\n"
+            f"Describe my character's situation: who they are singing to or "
+            f"about, where this number sits in the show or cycle, and what "
+            f"immediately precedes and follows it. For non-theatrical repertoire "
+            f"(art song, Lieder), substitute poetic context: poet, source poem "
+            f"or collection, and the speaker's situation.\n\n"
             f"3. Emotional Arc\n"
-            f"How does the character's emotional state move across the song? "
-            f"Identify the turning points by lyric phrase (not bar number — I "
-            f"am working from a lyric sheet, not a score). Make this detailed "
-            f"enough that I can mark up the page.\n\n"
+            f"Track how my character's inner state moves across the song. Mark "
+            f"every turning point by the lyric phrase where it occurs — not by "
+            f"bar number. Be detailed enough that I can annotate a printed lyric "
+            f"sheet.\n\n"
             f"4. Acting Direction\n"
-            f"Give concrete, beat-by-beat acting notes: where to lean in, where "
-            f"to pull back, what subtext changes a line's reading, what physical "
-            f"stillness or gesture supports a specific moment. Avoid generic "
-            f"advice such as 'feel it deeply'. Prefer specifics tied to the "
-            f"text, for example: 'the word X on line Y should land harder than "
-            f"the surrounding phrase because it is the first absolute the "
-            f"character commits to'.\n\n"
+            f"Give concrete, beat-by-beat acting notes for my character's lines "
+            f"only: where to lean in, where to pull back, what subtext shifts a "
+            f"line's reading, what physical stillness or gesture serves a moment. "
+            f"Avoid generic notes such as 'feel it deeply'. Anchor every note to "
+            f"a specific word or phrase.\n\n"
+            f"CRITICAL CONSTRAINT on Section 4: every acting note must be "
+            f"compatible with what the music physically demands at that moment. "
+            f"If the score calls for a belt, a sustained forte, or a climactic "
+            f"high note, do not direct me to pull back, go quiet, or make the "
+            f"moment smaller — that contradicts an irrevocable musical fact. "
+            f"Instead, show how my character's inner state justifies and fuels "
+            f"the vocal intensity the music requires. The acting serves the "
+            f"music; it does not override it.\n\n"
             f"5. Singing Direction\n"
-            f"Advise on vocal colour, dynamic shaping, straight tone versus "
-            f"vibrato, and breath strategy on long phrases. Tailor the advice "
-            f"to the declared style: for {style_phrase}, "
-        )
-
-        if raw_style == 'mt_ccm':
-            prompt += (
-                "favour speech-quality onsets, mix and belt considerations "
-                "where appropriate, and conversational rhythmic placement.\n\n"
-            )
-        else:
-            prompt += (
-                "favour legato, vibrato as the default tone, de-rhotacised r "
-                "in the Italian/German tradition, and balanced chiaroscuro.\n\n"
-            )
-
-        prompt += (
+            f"Research the specific vocal tradition for this role: how has it "
+            f"been cast and coached, what technique do authoritative productions "
+            f"and recordings use, what is the expected vocal colour and weight. "
+            f"Give advice grounded in that role-specific tradition — not in "
+            f"generic {style_phrase} rules. Name the technique or approach "
+            f"explicitly (for example: mix-belt at the break, legato sostenuto "
+            f"through the phrase, speech-quality onset on the verse). Address "
+            f"breath strategy on long phrases and any vowel modification the "
+            f"tessitura demands.\n\n"
             f"6. Tradition and Interpretation\n"
             f"Describe well-known recordings or stage interpretations and how "
-            f"they differ from one another. Note where the standard reading "
-            f"has been challenged or where multiple defensible interpretations "
-            f"coexist. Name specific singers and productions where possible.\n\n"
+            f"they differ. Note where the standard reading has been challenged "
+            f"or where multiple defensible interpretations coexist. Name "
+            f"specific singers and productions.\n\n"
             f"7. Pitfalls\n"
-            f"List common mistakes that singers make specifically with this "
-            f"song — rushed phrases, misplaced emphases, vowel colour traps, "
-            f"dramatic choices that read as clichéd. Be specific: name the "
-            f"line or word and explain why the mistake happens and what to do "
-            f"instead."
+            f"List common mistakes specific to this song and this role — rushed "
+            f"phrases, misplaced emphases, vowel traps, clichéd dramatic choices. "
+            f"For each pitfall, name the word or line, explain why the mistake "
+            f"happens, and say what to do instead."
         )
 
         QApplication.clipboard().setText(prompt)

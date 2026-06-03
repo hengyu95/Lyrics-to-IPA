@@ -1,6 +1,6 @@
 # Lyric IPA Finder
 
-A vowel and diction tool for singers working on musical theatre and classical repertoire. Paste lyrics, click a word, get its IPA breakdown, vowel chart position, and articulation notes. Inline hints mark up the full lyrics so you can see diction issues across the whole phrase at once.
+A vowel and diction tool for singers. Paste lyrics, click a word, get its IPA breakdown, vowel chart position, and articulation notes. Inline hints mark up the full lyrics so you can see diction issues across the whole phrase at once.
 
 **Personal project built with LLM assistance. The singing tips are algorithmically generated and not verified. Cross-check anything important with your teacher.**
 
