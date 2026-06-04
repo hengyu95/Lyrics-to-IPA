@@ -2656,9 +2656,10 @@ class MainWindow(QMainWindow):
         self._vowel_seq: list = []
         self._vowel_seq_idx = 0
         self._vowel_seq_active = False
+        self._seq_gap_ms: int = 150  # gap between vowels; restored from settings
         self._seq_gap = QTimer(self)
         self._seq_gap.setSingleShot(True)
-        self._seq_gap.setInterval(150)  # short pause between vowels
+        self._seq_gap.setInterval(self._seq_gap_ms)
         self._seq_gap.timeout.connect(self._advance_vowel_seq)
         self.player.mediaStatusChanged.connect(self._on_media_status)
         self._save_timer = QTimer(self)
@@ -2763,6 +2764,19 @@ class MainWindow(QMainWindow):
         th_layout.setSpacing(_scale(8))
         th_layout.addWidget(traj_title)
         th_layout.addStretch()
+        # Speed selector for Play line vowels
+        self._seq_speed_label = QLabel('Gap:')
+        self._seq_speed_label.setObjectName('Caption')
+        self._seq_speed_combo = QComboBox()
+        self._seq_speed_combo.setFixedHeight(_scale(22))
+        self._seq_speed_combo.setToolTip(
+            'Pause between vowels when playing the line in sequence.')
+        for label, ms in self._SEQ_SPEED_PRESETS:
+            self._seq_speed_combo.addItem(label, ms)
+        self._seq_speed_combo.setCurrentIndex(1)  # default: Normal (150 ms)
+        self._seq_speed_combo.currentIndexChanged.connect(self._on_seq_speed_changed)
+        th_layout.addWidget(self._seq_speed_label)
+        th_layout.addWidget(self._seq_speed_combo)
         self.play_line_btn = QToolButton()
         self.play_line_btn.setObjectName('HintsToggle')
         self.play_line_btn.setFixedHeight(_scale(22))
@@ -3062,6 +3076,23 @@ class MainWindow(QMainWindow):
                 return next_prons[min(preferred, len(next_prons) - 1)]
         return None
 
+
+    # ---- Sequential playback speed presets ----
+
+    # (label, gap_ms) — gap inserted between vowels after audio finishes
+    _SEQ_SPEED_PRESETS = [
+        ('Fast',    0),
+        ('Normal', 150),
+        ('Slow',   400),
+    ]
+
+    def _on_seq_speed_changed(self, index: int):
+        ms = self._seq_speed_combo.itemData(index)
+        if ms is None:
+            return
+        self._seq_gap_ms = int(ms)
+        self._seq_gap.setInterval(self._seq_gap_ms)
+        self.settings.setValue('seqGapMs', self._seq_gap_ms)
 
     # ---- Inline annotation hints ----
 
@@ -3910,6 +3941,21 @@ class MainWindow(QMainWindow):
                         if key:
                             act.setChecked(key in self._enabled_hint_types)
         self._update_hints_btn_label()
+        # Persist Play-line-vowels gap speed
+        saved_gap = self.settings.value('seqGapMs', None)
+        if saved_gap is not None:
+            self._seq_gap_ms = int(saved_gap)
+            self._seq_gap.setInterval(self._seq_gap_ms)
+            # Sync combo to the nearest preset (exact match preferred)
+            best_idx = 1  # fallback to Normal
+            best_diff = abs(self._seq_gap_ms - self._SEQ_SPEED_PRESETS[1][1])
+            for i, (_, ms) in enumerate(self._SEQ_SPEED_PRESETS):
+                diff = abs(self._seq_gap_ms - ms)
+                if diff < best_diff:
+                    best_diff, best_idx = diff, i
+            self._seq_speed_combo.blockSignals(True)
+            self._seq_speed_combo.setCurrentIndex(best_idx)
+            self._seq_speed_combo.blockSignals(False)
 
 
     def _line_to_ipa(self, line_text: str, line_base: int = -1) -> str:
