@@ -13,6 +13,7 @@ custom-IPA overrides.
 """
 from __future__ import annotations
 
+import atexit
 import base64
 import html
 import json
@@ -30,17 +31,19 @@ from typing import Optional
 # ── HiDPI must be set before QApplication is created ──────────────────────────
 os.environ.setdefault('QT_AUTO_SCREEN_SCALE_FACTOR', '1')
 
-from PyQt5.QtCore import (Qt, QUrl, QSettings, QStandardPaths, QTimer,
-                          pyqtSignal)
+from PyQt5.QtCore import (Qt, QPoint, QRect, QUrl, QSettings,
+                          QStandardPaths, QTimer, pyqtSignal)
 from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QIcon, QLinearGradient,
-                         QPainter, QPalette, QTextCharFormat, QTextCursor)
+                         QPainter, QPalette, QPolygon,
+                         QTextCharFormat, QTextCursor)
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtWidgets import (QAction, QApplication, QComboBox, QDialog,
                              QDialogButtonBox, QFrame, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QMainWindow,
                              QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-                             QScrollArea, QSizePolicy, QSplitter, QTextEdit,
-                             QToolButton, QToolTip, QVBoxLayout, QWidget)
+                             QScrollArea, QSizePolicy, QSplitter, QStackedWidget,
+                             QTextEdit, QToolButton, QToolTip, QVBoxLayout,
+                             QWidget)
 import svgwrite
 import eng_to_ipa as ipa
 
@@ -418,6 +421,29 @@ def brightness_color(b: float) -> QColor:
 
 
 
+def _tts_temp_dir() -> str:
+    """Return (creating if needed) a dedicated folder for TTS SSML temp files."""
+    d = os.path.join(tempfile.gettempdir(), 'LyricsToIPA_tts')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _tts_cleanup() -> None:
+    """Delete any leftover TTS temp files.  Called at exit and on startup."""
+    d = os.path.join(tempfile.gettempdir(), 'LyricsToIPA_tts')
+    if not os.path.isdir(d):
+        return
+    for name in os.listdir(d):
+        if name.startswith('tts_') and name.endswith('.xml'):
+            try:
+                os.unlink(os.path.join(d, name))
+            except OSError:
+                pass
+
+
+atexit.register(_tts_cleanup)
+
+
 def _tts_speak(word: str, ipa_pron: str = '') -> None:
     """Speak *word* via system TTS, using *ipa_pron* where supported.
 
@@ -454,13 +480,14 @@ def _tts_speak(word: str, ipa_pron: str = '') -> None:
                     f'xml:lang="en-US">{safe_word}</speak>'
                 )
 
-            # Write to a temp file so PowerShell reads it cleanly — no
-            # inline escaping of IPA/Unicode characters in the PS command.
-            tmp = tempfile.NamedTemporaryFile(
-                mode='w', suffix='.xml', delete=False, encoding='utf-8')
-            tmp.write(ssml)
-            tmp_path = tmp.name
-            tmp.close()
+            # Write to a temp file in a dedicated subfolder so cleanup is
+            # easy and leftover files stay contained.
+            tmp_dir = _tts_temp_dir()
+            import uuid as _uuid
+            tmp_path = os.path.join(tmp_dir,
+                                    f'tts_{_uuid.uuid4().hex}.xml')
+            with open(tmp_path, 'w', encoding='utf-8') as _tf:
+                _tf.write(ssml)
 
             # Forward slashes work fine in PowerShell paths and avoid
             # backslash escaping inside the double-quoted PS string.
@@ -511,11 +538,64 @@ class WordAnnotation:
     bg_color: str    # background tint hex
 
 
+
+@dataclass
+class CoachingNote:
+    anchor_start: str   # "word#N"
+    anchor_end: str     # "word#N" (== anchor_start for a single word)
+    text: str
+
+
 # =============================================================================
 # Tokenization & syllable extraction
 # =============================================================================
 
-WORD_RE = re.compile(r"[A-Za-z]+(?:['\u2018\u2019][A-Za-z]+)*|[0-9]+")
+WORD_RE = re.compile(
+    r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['\u2018\u2019][A-Za-zÀ-ÖØ-öø-ÿ]+)*|[0-9]+"
+)
+
+
+def word_occurrences(lyrics: str) -> list:
+    """Return list of (match, 'word#N') in document order."""
+    counts: dict = {}
+    out: list = []
+    for m in WORD_RE.finditer(lyrics):
+        wl = m.group().lower()
+        out.append((m, f'{wl}#{counts.get(wl, 0)}'))
+        counts[wl] = counts.get(wl, 0) + 1
+    return out
+
+
+def resolve_anchor(lyrics: str, start_key: str, end_key: str):
+    """Return (abs_start, abs_end) covering the inclusive span, or None if
+    either endpoint occurrence is missing."""
+    pos = {k: m for m, k in word_occurrences(lyrics)}
+    a, b = pos.get(start_key), pos.get(end_key)
+    if a is None or b is None:
+        return None
+    lo, hi = sorted((a.start(), b.end()))   # tolerate reversed drag
+    return (lo, hi)
+
+
+def _coaching_wrap_text(text: str, fm: QFontMetrics, max_w: int) -> list:
+    """Wrap *text* into lines no wider than *max_w* pixels.
+    Always returns at least one element (may be empty string)."""
+    words = text.split()
+    if not words:
+        return ['']
+    lines: list = []
+    cur = ''
+    for w in words:
+        candidate = (cur + ' ' + w).strip() if cur else w
+        if fm.horizontalAdvance(candidate) <= max_w:
+            cur = candidate
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines or ['']
 
 VOWEL_CHARS = ''.join(VOWELS.keys())
 _vowel_re = re.compile(
@@ -1204,6 +1284,7 @@ class Song:
     dismissed_tips: set = field(default_factory=set)  # words whose inline hint is dismissed
     style: str = 'classical'  # 'classical' | 'mt_ccm'
     sustained_words: set = field(default_factory=set)  # words marked as sustained
+    coaching_notes: list = field(default_factory=list)  # list[CoachingNote]
 
     def _present_words(self):
         """Set of lowercase words currently in the lyrics."""
@@ -1236,7 +1317,11 @@ class Song:
                 'pron_choices': {k: v for k, v in self.pron_choices.items() if keep_pron(k)},
                 'dismissed_tips': [w for w in self.dismissed_tips if w in pw],
                 'style': self.style,
-                'sustained_words': [w for w in self.sustained_words if w in pw]}
+                'sustained_words': [w for w in self.sustained_words if w in pw],
+                'coaching_notes': [
+                    {'start': n.anchor_start, 'end': n.anchor_end, 'text': n.text}
+                    for n in self.coaching_notes
+                ]}
 
     @classmethod
     def from_dict(cls, d):
@@ -1246,7 +1331,14 @@ class Song:
                    pron_choices=dict(d.get('pron_choices', {})),
                    dismissed_tips=set(d.get('dismissed_tips', [])),
                    style=d.get('style', 'classical'),
-                   sustained_words=set(d.get('sustained_words', [])))
+                   sustained_words=set(d.get('sustained_words', [])),
+                   coaching_notes=[
+                       CoachingNote(
+                           d2.get('start', ''),
+                           d2.get('end', ''),
+                           d2.get('text', ''))
+                       for d2 in d.get('coaching_notes', [])
+                   ])
 
 
 class SongStore:
@@ -1277,6 +1369,15 @@ class SongStore:
             tmp = self.path + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+            # Rolling one-file backup: copy existing songs.json → songs.bak.json
+            # before the atomic replace so a bad write never loses all data.
+            bak = os.path.join(self.dir, 'songs.bak.json')
+            if os.path.exists(self.path):
+                try:
+                    import shutil as _shutil
+                    _shutil.copy2(self.path, bak)
+                except OSError:
+                    pass
             os.replace(tmp, self.path)  # atomic on Windows and POSIX
         except (IOError, OSError) as e:
             print(f'Warning: failed to save songs: {e}', file=sys.stderr)
@@ -1568,6 +1669,21 @@ QLabel#StressWarning {{
 """
 
 
+def _blend_hex(base_hex: str, tint_hex: str, t: float) -> QColor:
+    """Blend *base_hex* toward *tint_hex* by factor *t* (0.0 = base, 1.0 = tint)."""
+    t = max(0.0, min(1.0, t))
+    def _ch(h: str) -> tuple:
+        h = h.lstrip('#')
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    br, bg, bb = _ch(base_hex)
+    tr, tg, tb = _ch(tint_hex)
+    return QColor(
+        round(br + (tr - br) * t),
+        round(bg + (tg - bg) * t),
+        round(bb + (tb - bb) * t),
+    )
+
+
 # =============================================================================
 # Widgets
 # =============================================================================
@@ -1611,6 +1727,8 @@ class LyricsEditor(QTextEdit):
     def __init__(self):
         super().__init__()
         self._annotation_map = {}   # (block, start, end) -> WordAnnotation
+        self._hint_opacity: float = 1.0
+        self._last_annotations: list = []
         self.setMouseTracking(True)
         self.setPlaceholderText(
             "Paste lyrics here. Click any word to see its IPA, vowel chart, "
@@ -1632,18 +1750,27 @@ class LyricsEditor(QTextEdit):
 
     def set_annotations(self, annotations: list):
         """Apply background-tint + underline for all word annotations.
-        Background tint is the primary visual signal on dark backgrounds.
+        Background tint is blended toward the editor base color by _hint_opacity
+        (1.0 = full tint, 0.0 = invisible). Underlines are always solid at full
+        color so the word remains flagged even at 0% opacity.
         """
+        self._last_annotations = list(annotations)
         self._annotation_map = {
             (a.block, a.start, a.end): a for a in annotations
         }
+        self._rebuild_extra_selections()
+
+    def _rebuild_extra_selections(self):
+        """Re-apply extra-selections using the current _hint_opacity."""
+        _EDITOR_BASE = '#1c2230'
         selections = []
-        for a in annotations:
+        for a in self._last_annotations:
             cur = QTextCursor(self.document())
             cur.setPosition(a.abs_start)
             cur.setPosition(a.abs_end, QTextCursor.KeepAnchor)
             fmt = QTextCharFormat()
-            fmt.setBackground(QColor(a.bg_color))
+            blended = _blend_hex(_EDITOR_BASE, a.bg_color, self._hint_opacity)
+            fmt.setBackground(blended)
             fmt.setUnderlineStyle(
                 ANN_UNDERLINE_STYLE.get(a.tip_type, QTextCharFormat.SingleUnderline))
             fmt.setUnderlineColor(QColor(a.color))
@@ -1653,8 +1780,14 @@ class LyricsEditor(QTextEdit):
             selections.append(sel)
         self.setExtraSelections(selections)
 
+    def set_highlight_opacity(self, opacity: float):
+        """Set hint-highlight opacity [0.0, 1.0] and re-draw existing annotations."""
+        self._hint_opacity = max(0.0, min(1.0, opacity))
+        self._rebuild_extra_selections()
+
     def clear_annotations(self):
         self._annotation_map = {}
+        self._last_annotations = []
         self.setExtraSelections([])
 
     def _annotation_at_pos(self, pos):
@@ -1711,6 +1844,968 @@ class LyricsEditor(QTextEdit):
             self.insertPlainText(text)
         else:
             super().insertFromMimeData(source)
+
+
+# =============================================================================
+# Coaching Notes view — custom-painted read-only lyrics canvas with bubbles
+# =============================================================================
+
+class _NoteEditOverlay(QPlainTextEdit):
+    """Floating inline editor placed over a coaching bubble while the user types.
+
+    Emits ``commit_edit(True)`` on Ctrl+Enter or focus-out, and
+    ``commit_edit(False)`` on Escape.  A ``_fired`` guard prevents the signal
+    from firing more than once per instance.
+    """
+    commit_edit = pyqtSignal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._fired = False
+        self.setFrameShape(QFrame.Box)
+        self.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+
+    def _fire(self, commit: bool):
+        if not self._fired:
+            self._fired = True
+            self.commit_edit.emit(commit)
+
+    def keyPressEvent(self, ev):
+        k = ev.key()
+        if k == Qt.Key_Escape:
+            self._fire(False)
+        elif k in (Qt.Key_Return, Qt.Key_Enter) and (ev.modifiers() & Qt.ControlModifier):
+            self._fire(True)
+        else:
+            super().keyPressEvent(ev)
+
+    def focusOutEvent(self, ev):
+        super().focusOutEvent(ev)
+        self._fire(True)   # focus-out → commit (empty → delete in _close_edit)
+
+
+class CoachingView(QWidget):
+    """Read-only lyrics canvas with speech-bubble coaching notes in gutters.
+
+    Layout algorithm
+    ----------------
+    Lyrics are split on \\n into *blocks*.  Within each block, words are
+    word-wrapped left-to-right.  After the last row of a block a *gutter* is
+    reserved: each note whose resolved anchor_start falls in that block gets
+    one bubble (rounded rect + upward connector triangle).  Bubbles stack
+    vertically.  A minimal empty gutter keeps consistent vertical rhythm.
+
+    HiDPI discipline
+    ----------------
+    * Font size comes from ``_font_pt`` (logical pt) — never multiplied by DPR.
+    * All structural sizes (paddings, radii, triangle) go through ``_scale()``.
+    * All text metrics come from ``QFontMetrics``.
+    """
+
+    notes_changed = pyqtSignal()
+    word_clicked  = pyqtSignal(str, int, int)  # word_lower, block_number, char_offset
+
+    # ── layout constants (raw logical px passed to _scale) ──────────────────
+    _MARGIN      = 14   # left/right content margin
+    _WORD_GAP    = 4    # horizontal gap between words on the same row
+    _ROW_GAP     = 4    # extra vertical gap between wrapped rows inside a block
+    _TEXT_GUTTER = 10   # gap from last text row to triangle apex
+    _BUB_GAP     = 6    # vertical gap between successive bubbles in one gutter
+    _BLOCK_GAP   = 20   # gap from end of gutter to start of next block's rows
+    _GUT_EMPTY   = 6    # min gutter height when a block has no notes
+    _BPAD_H      = 8    # horizontal text padding inside bubble
+    _BPAD_V      = 5    # vertical text padding inside bubble
+    _BRAD        = 6    # bubble corner radius
+    _TRI_W       = 7    # connector triangle half-width
+    _TRI_H       = 6    # connector triangle height
+    _ACCENT_BAR  = 3    # width of accent left-border strip inside bubble
+
+    _FOLD_SIZE   = 11   # dog-ear fold triangle size
+
+    # ── theme (lyrics) ───────────────────────────────────────────────────────
+    _C_BG     = '#14181f'
+    _C_PANEL  = '#1c2230'
+    _C_BORDER = '#2c344a'
+    _C_TEXT   = '#d8dfe8'
+    _C_MUTED  = '#98a8c0'
+    _C_ACCENT = '#7898d0'
+
+    # ── theme (post-it bubbles) ───────────────────────────────────────────────
+    _C_BUB_BG      = '#f0e0a0'   # warm post-it yellow (paper face)
+    _C_BUB_BORDER  = '#b89828'   # amber border visible on dark app bg
+    _C_BUB_ACCENT  = '#7a5c00'   # dark amber left-bar (contrasts with yellow bg)
+    _C_BUB_TEXT    = '#1c1a06'   # near-black ink on yellow
+
+    def __init__(self):
+        super().__init__()
+        self._song: object = None
+        self._lyrics: str = ''
+        self._notes: list = []        # live reference to song.coaching_notes
+
+        self._font_pt: int = 16       # synced from MainWindow._editor_font_size
+
+        # layout cache (rebuilt by _relayout)
+        self._word_infos:   list = []  # dicts: word, key, pw, h, x, y, bi
+        self._bubble_infos: list = []  # dicts: note, rect, lines, tri_x, tri_y
+
+        # interaction state
+        self._press_word: object = None   # word-info dict at mouse-down
+        self._hover_word: object = None   # word-info dict currently under cursor
+        self._hovered_bubble_info: object = None   # bubble-info dict under cursor
+        self._dragging: bool = False
+
+        # edit-overlay state
+        self._edit_note: object = None
+        self._edit_is_new: bool = False
+        self._edit_ov: object = None   # _NoteEditOverlay or None
+
+        self.setMouseTracking(True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setFocusPolicy(Qt.ClickFocus)
+        self._total_h: int = _scale(100)
+
+    # ── public API ───────────────────────────────────────────────────────────
+
+    def set_song(self, song):
+        self._close_edit(commit=True)
+        self._song   = song
+        self._lyrics = song.lyrics if song else ''
+        self._notes  = song.coaching_notes if song else []
+        self._relayout()
+
+    def set_font_pt(self, pt: int):
+        self._font_pt = pt
+        self._relayout()
+
+    def sizeHint(self):
+        from PyQt5.QtCore import QSize
+        return QSize(max(200, self.width()), getattr(self, '_total_h', _scale(100)))
+
+    # ── font ─────────────────────────────────────────────────────────────────
+
+    def _font(self) -> QFont:
+        return QFont('Inter', self._font_pt)
+
+    def _bubble_font(self) -> QFont:
+        """Bubble note font — Candara sits between Inter and handwritten."""
+        return QFont('Candara', max(8, self._font_pt - 4))
+
+    # ── layout ───────────────────────────────────────────────────────────────
+
+    def _relayout(self):
+        W = self.width()
+        if W <= 10:
+            self.update()
+            return
+
+        margin     = _scale(self._MARGIN)
+        word_gap   = _scale(self._WORD_GAP)
+        row_gap    = _scale(self._ROW_GAP)
+        text_gut   = _scale(self._TEXT_GUTTER)
+        bub_gap    = _scale(self._BUB_GAP)
+        block_gap  = _scale(self._BLOCK_GAP)
+        gut_empty  = _scale(self._GUT_EMPTY)
+        bpad_h     = _scale(self._BPAD_H)
+        bpad_v     = _scale(self._BPAD_V)
+        tri_h      = _scale(self._TRI_H)
+        tri_w      = _scale(self._TRI_W)
+        acc_bar    = _scale(self._ACCENT_BAR)
+
+        content_w  = max(_scale(60), W - 2 * margin)
+
+        font  = self._font()
+        fm    = QFontMetrics(font)
+        lh    = fm.height()
+        l_gap = _scale(2)   # gap between text lines inside a bubble
+
+        bub_font = self._bubble_font()
+        bfm      = QFontMetrics(bub_font)
+        blh      = bfm.height()
+        bl_gap   = _scale(2)
+
+        blocks = self._lyrics.split('\n')
+
+        # ── pass 1: tokenise words, assign keys ──────────────────────────────
+        global_counts: dict = {}
+        block_word_lists: list = []
+
+        for block_text in blocks:
+            wds: list = []
+            for m in WORD_RE.finditer(block_text):
+                wl = m.group().lower()
+                n  = global_counts.get(wl, 0)
+                global_counts[wl] = n + 1
+                wds.append({
+                    'word': m.group(),
+                    'key':  f'{wl}#{n}',
+                    'pw':   fm.horizontalAdvance(m.group()),
+                    'h':    lh,
+                    'co':   m.start(),   # char offset within the block/line
+                })
+            block_word_lists.append(wds)
+
+        # ── pass 2: route notes to blocks ────────────────────────────────────
+        key_to_bi: dict = {}
+        for bi, wds in enumerate(block_word_lists):
+            for wi in wds:
+                key_to_bi[wi['key']] = bi
+
+        block_notes: dict = {bi: [] for bi in range(len(blocks))}
+        for note in self._notes:
+            bi = key_to_bi.get(note.anchor_start)
+            if bi is not None:
+                block_notes[bi].append(note)
+
+        # ── pass 3: assign positions ──────────────────────────────────────────
+        self._word_infos   = []
+        self._bubble_infos = []
+
+        y = _scale(12)   # top padding
+
+        for bi, (block_text, wds) in enumerate(zip(blocks, block_word_lists)):
+            # --- word-wrap into rows ---
+            rows: list = []
+            cur_row: list = []
+            cur_x = 0
+            for raw_wi in wds:
+                pw = raw_wi['pw']
+                if cur_row and cur_x + word_gap + pw > content_w:
+                    rows.append(cur_row)
+                    cur_row = []
+                    cur_x = 0
+                wi = dict(raw_wi)   # copy so we can annotate with position
+                wi['x']  = margin + cur_x
+                wi['bi'] = bi
+                cur_row.append(wi)
+                cur_x += pw + word_gap
+            if cur_row:
+                rows.append(cur_row)
+
+            # --- assign row y-positions ---
+            row_y = y
+            for row in rows:
+                for wi in row:
+                    wi['y'] = row_y
+                self._word_infos.extend(row)
+                row_y += lh + row_gap
+
+            text_bottom = (row_y - row_gap) if rows else (y + lh)
+
+            # --- build key→wi map for connector x-computation ----------------
+            key_map: dict = {}
+            for wi in self._word_infos:
+                if wi.get('bi') == bi:
+                    key_map[wi['key']] = wi
+
+            # --- gutter -------------------------------------------------------
+            notes_here = block_notes.get(bi, [])
+            cur_bub_y  = text_bottom + text_gut  # apex y of first triangle row
+
+            if not notes_here:
+                y = cur_bub_y + gut_empty + block_gap
+            else:
+                # Per-note natural sizing then horizontal flow
+                bub_single_max = min(W - margin, _scale(320))
+                bub_min_w_     = _scale(50)
+                flow_max_w     = W - margin   # row can extend to near right edge
+
+                # Step 1 — compute each bubble's natural (content-fit) size
+                sized = []
+                for note in notes_here:
+                    raw_w = (bfm.horizontalAdvance(note.text)
+                             + 2 * bpad_h + acc_bar + _scale(10))
+                    bub_w = max(bub_min_w_, min(raw_w, bub_single_max))
+                    text_max_w = bub_w - 2 * bpad_h - acc_bar - _scale(4)
+                    blines = _coaching_wrap_text(note.text, bfm, text_max_w)
+                    bub_text_h = (len(blines) * blh
+                                  + max(0, len(blines) - 1) * bl_gap)
+                    bub_h = bub_text_h + 2 * bpad_v
+                    sized.append((note, bub_w, bub_h, blines))
+
+                # Step 2 — flow bubbles left-to-right, wrapping as needed
+                row_x          = margin
+                row_top_y      = cur_bub_y + tri_h
+                tri_apex_row_y = cur_bub_y
+                row_max_bot    = row_top_y   # tallest bubble bottom in cur row
+
+                for note, bub_w, bub_h, blines in sized:
+                    # Wrap to next row when this bubble won't fit
+                    if row_x > margin and row_x + bub_w > flow_max_w:
+                        row_top_y      = row_max_bot + bub_gap + tri_h
+                        tri_apex_row_y = row_max_bot + bub_gap
+                        row_x          = margin
+                        row_max_bot    = row_top_y
+
+                    bub_x = row_x
+                    bub_y = row_top_y
+
+                    # Triangle connector x — centre of anchor_start word
+                    start_wi = key_map.get(note.anchor_start)
+                    if start_wi:
+                        raw_tri_x = start_wi['x'] + start_wi['pw'] // 2
+                    else:
+                        raw_tri_x = bub_x + bub_w // 2
+                    tri_x = max(bub_x + tri_w + _scale(2),
+                                min(raw_tri_x,
+                                    bub_x + bub_w - tri_w - _scale(2)))
+
+                    self._bubble_infos.append({
+                        'note':        note,
+                        'rect':        QRect(bub_x, bub_y, bub_w, bub_h),
+                        'lines':       blines,
+                        'tri_x':       tri_x,
+                        'tri_apex_y':  tri_apex_row_y,
+                    })
+
+                    row_max_bot = max(row_max_bot, bub_y + bub_h)
+                    row_x      += bub_w + bub_gap
+
+                y = row_max_bot + block_gap
+
+        self._total_h = y + _scale(12)
+        self.setMinimumHeight(self._total_h)
+        self.update()
+
+    # ── painting ─────────────────────────────────────────────────────────────
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.fillRect(self.rect(), QColor(self._C_BG))
+
+        if not self._lyrics:
+            p.setPen(QColor(self._C_MUTED))
+            p.setFont(self._font())
+            p.drawText(self.rect(), Qt.AlignCenter,
+                       'Switch to editor mode to enter lyrics,\n'
+                       'then return here to add coaching notes.')
+            return
+
+        font = self._font()
+        fm   = QFontMetrics(font)
+        p.setFont(font)
+        lh     = fm.height()
+        bpad_h = _scale(self._BPAD_H)
+        bpad_v = _scale(self._BPAD_V)
+        brad   = _scale(self._BRAD)
+        tri_h  = _scale(self._TRI_H)
+        tri_w  = _scale(self._TRI_W)
+        acc_bar = _scale(self._ACCENT_BAR)
+        pad    = _scale(2)
+
+        bub_font = self._bubble_font()
+        bfm      = QFontMetrics(bub_font)
+        blh      = bfm.height()
+        bl_gap   = _scale(2)
+
+        # ── determine the "active" note (being edited or hovered) ────────────
+        active_note = None
+        if self._edit_note is not None:
+            active_note = self._edit_note
+        elif self._hovered_bubble_info is not None:
+            active_note = self._hovered_bubble_info['note']
+
+        # ── collect keys by highlight tier ───────────────────────────────────
+        # active_keys: span of the currently focused note (bright amber)
+        # passive_keys: spans of all other notes (dim blue tint)
+        active_keys:  set = set()
+        passive_keys: set = set()
+
+        def _span_keys(note):
+            start_i = end_i = None
+            for idx, wi in enumerate(self._word_infos):
+                if wi['key'] == note.anchor_start and start_i is None:
+                    start_i = idx
+                if wi['key'] == note.anchor_end:
+                    end_i = idx
+            if start_i is not None and end_i is not None:
+                lo = min(start_i, end_i)
+                hi = max(start_i, end_i)
+                return {self._word_infos[i]['key'] for i in range(lo, hi + 1)}
+            return set()
+
+        for bi_info in self._bubble_infos:
+            note = bi_info['note']
+            keys = _span_keys(note)
+            if note is active_note:
+                active_keys |= keys
+            else:
+                passive_keys |= keys
+
+        # Active keys win over passive
+        passive_keys -= active_keys
+
+        # ── drag-selection highlight ──────────────────────────────────────────
+        drag_keys: set = set()
+        if self._dragging and self._press_word and self._hover_word:
+            if self._press_word.get('bi') == self._hover_word.get('bi'):
+                pi = next((i for i, w in enumerate(self._word_infos)
+                           if w is self._press_word), None)
+                hi_ = next((i for i, w in enumerate(self._word_infos)
+                            if w is self._hover_word), None)
+                if pi is not None and hi_ is not None:
+                    lo = min(pi, hi_)
+                    hi = max(pi, hi_)
+                    for idx in range(lo, hi + 1):
+                        drag_keys.add(self._word_infos[idx]['key'])
+
+        # ── draw words ────────────────────────────────────────────────────────
+        active_c  = QColor(self._C_BUB_ACCENT);  active_c.setAlpha(80)
+        passive_c = QColor(self._C_ACCENT);       passive_c.setAlpha(45)
+        drag_c    = QColor('#c0d0ff');             drag_c.setAlpha(40)
+
+        for wi in self._word_infos:
+            wr  = QRect(wi['x'] - pad, wi['y'],
+                        wi['pw'] + 2 * pad, wi['h'])
+            key = wi['key']
+            if key in drag_keys:
+                p.fillRect(wr, drag_c)
+            elif key in active_keys:
+                p.fillRect(wr, active_c)
+            elif key in passive_keys:
+                p.fillRect(wr, passive_c)
+            p.setPen(QColor(self._C_TEXT))
+            p.drawText(wi['x'], wi['y'], wi['pw'] + pad, wi['h'],
+                       Qt.AlignLeft | Qt.AlignVCenter, wi['word'])
+
+        # ── draw bubbles ──────────────────────────────────────────────────────
+        c_bub_bg     = QColor(self._C_BUB_BG)
+        c_bub_border = QColor(self._C_BUB_BORDER)
+        c_bub_accent = QColor(self._C_BUB_ACCENT)
+        c_bub_text   = QColor(self._C_BUB_TEXT)
+        c_active_border = QColor(self._C_BUB_ACCENT).darker(130)
+
+        # ruled lines: slightly darker than the yellow paper
+        c_rule = QColor(self._C_BUB_BG).darker(118)
+        c_rule.setAlpha(200)
+
+        # dog-ear fold: face is lighter (like the paper backside); shadow is darker
+        c_fold_face   = QColor('#fffde8')
+        c_fold_shadow = QColor(self._C_BUB_BG).darker(128)
+
+        fold_size = _scale(self._FOLD_SIZE)
+        shadow_off = _scale(2)
+        shadow_c = QColor(0, 0, 0, 45)
+
+        for bi_info in self._bubble_infos:
+            note       = bi_info['note']
+            rect       = bi_info['rect']
+            tri_x      = bi_info['tri_x']
+            tri_apex_y = bi_info['tri_apex_y']
+            lines      = bi_info['lines']
+            is_active  = (note is active_note)
+
+            border_c = c_active_border if is_active else c_bub_border
+
+            # ── drop shadow ───────────────────────────────────────────────────
+            shadow_rect = QRect(rect.left() + shadow_off,
+                                rect.top() + shadow_off,
+                                rect.width(), rect.height())
+            p.setPen(Qt.NoPen)
+            p.setBrush(shadow_c)
+            p.drawRoundedRect(shadow_rect, brad, brad)
+
+            # ── connector triangle ────────────────────────────────────────────
+            tri_pts = QPolygon([
+                QPoint(tri_x,         tri_apex_y),
+                QPoint(tri_x - tri_w, rect.top()),
+                QPoint(tri_x + tri_w, rect.top()),
+            ])
+            p.setPen(border_c)
+            p.setBrush(c_bub_bg)
+            p.drawPolygon(tri_pts)
+
+            # ── bubble body ───────────────────────────────────────────────────
+            p.setPen(border_c)
+            p.setBrush(c_bub_bg)
+            p.drawRoundedRect(rect, brad, brad)
+
+            # ── paper grain texture (very subtle diagonal fibres) ─────────────
+            grain_c = QColor('#4a3800')
+            p.setOpacity(0.04)
+            p.setPen(grain_c)
+            grain_step = max(_scale(4), blh // 2)
+            for gx in range(rect.left(), rect.right() + rect.height(), grain_step):
+                p.drawLine(gx, rect.top(), gx - rect.height(), rect.bottom())
+            p.setOpacity(1.0)
+
+            # ── ruled notebook lines ──────────────────────────────────────────
+            p.setPen(c_rule)
+            rule_y = rect.top() + bpad_v + blh + bl_gap // 2
+            rule_x1 = rect.left() + acc_bar + _scale(4)
+            rule_x2 = rect.right() - _scale(4)
+            while rule_y < rect.bottom() - _scale(3):
+                p.drawLine(rule_x1, rule_y, rule_x2, rule_y)
+                rule_y += blh + bl_gap
+
+            # ── accent left-border strip ──────────────────────────────────────
+            p.fillRect(QRect(rect.left() + _scale(1),
+                             rect.top() + brad,
+                             acc_bar,
+                             rect.height() - 2 * brad),
+                       c_bub_accent)
+
+            # ── dog-ear fold (top-right corner) ──────────────────────────────
+            # shadow triangle (slightly behind the fold)
+            fold_shadow_pts = QPolygon([
+                QPoint(rect.right() - fold_size + _scale(1), rect.top()),
+                QPoint(rect.right(),                         rect.top() + fold_size - _scale(1)),
+                QPoint(rect.right(),                         rect.top()),
+            ])
+            p.setPen(Qt.NoPen)
+            p.setBrush(c_fold_shadow)
+            p.drawPolygon(fold_shadow_pts)
+
+            # fold face triangle
+            fold_pts = QPolygon([
+                QPoint(rect.right() - fold_size, rect.top()),
+                QPoint(rect.right(),              rect.top() + fold_size),
+                QPoint(rect.right(),              rect.top()),
+            ])
+            p.setBrush(c_fold_face)
+            p.drawPolygon(fold_pts)
+
+            # fold crease line
+            p.setPen(border_c)
+            p.drawLine(rect.right() - fold_size, rect.top(),
+                       rect.right(),              rect.top() + fold_size)
+
+            # ── bubble text (smaller font) ────────────────────────────────────
+            p.setFont(bub_font)
+            p.setPen(c_bub_text)
+            tx = rect.left() + bpad_h + acc_bar
+            ty = rect.top() + bpad_v
+            tw = rect.width() - bpad_h - acc_bar - fold_size - _scale(2)
+            for line in lines:
+                p.drawText(tx, ty, tw, blh,
+                           Qt.AlignLeft | Qt.AlignVCenter, line)
+                ty += blh + bl_gap
+            p.setFont(font)   # restore word font
+
+        p.end()
+
+    # ── hit-test helpers ──────────────────────────────────────────────────────
+
+    def _word_at(self, pos) -> object:
+        py, px = pos.y(), pos.x()
+        fm  = QFontMetrics(self._font())
+        lh  = fm.height()
+        pad = _scale(4)
+        for wi in self._word_infos:
+            if (wi['x'] - pad <= px <= wi['x'] + wi['pw'] + pad
+                    and wi['y'] - pad <= py <= wi['y'] + lh + pad):
+                return wi
+        return None
+
+    def _bubble_at(self, pos) -> object:
+        py, px = pos.y(), pos.x()
+        for bi_info in self._bubble_infos:
+            r = bi_info['rect']
+            if r.contains(px, py):
+                return bi_info
+        return None
+
+    # ── mouse events ──────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, ev):
+        if ev.button() != Qt.LeftButton:
+            return
+        # Note: any open overlay already received focusOutEvent → committed.
+        bi_info = self._bubble_at(ev.pos())
+        if bi_info:
+            self._start_edit(bi_info['note'], is_new=False)
+            return
+        wi = self._word_at(ev.pos())
+        if wi:
+            # Emit word_clicked so the Analysis panel updates (additive, before note logic)
+            self.word_clicked.emit(wi['word'].lower(), wi.get('bi', 0), wi.get('co', 0))
+            self._press_word = wi
+            self._hover_word = wi
+            self._dragging   = False
+            self.update()
+
+    def mouseMoveEvent(self, ev):
+        wi = self._word_at(ev.pos())
+        self._hover_word = wi
+        if self._press_word and wi and (ev.buttons() & Qt.LeftButton):
+            if wi is not self._press_word:
+                self._dragging = True
+        # Update hovered bubble (only when not dragging a new span)
+        if not self._dragging:
+            self._hovered_bubble_info = self._bubble_at(ev.pos())
+        self.update()
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() != Qt.LeftButton or self._press_word is None:
+            self._press_word = None
+            self._dragging   = False
+            self._hovered_bubble_info = None
+            self.update()
+            return
+
+        press    = self._press_word
+        hover    = self._hover_word or press
+        dragging = self._dragging
+
+        self._press_word = None
+        self._dragging   = False
+        self._hovered_bubble_info = None
+        self.update()
+        if (dragging and hover is not press
+                and hover.get('bi') == press.get('bi')):
+            pi = next((i for i, w in enumerate(self._word_infos)
+                       if w is press), None)
+            hi_ = next((i for i, w in enumerate(self._word_infos)
+                        if w is hover), None)
+            if pi is not None and hi_ is not None:
+                lo  = min(pi, hi_)
+                hi  = max(pi, hi_)
+                start_key = self._word_infos[lo]['key']
+                end_key   = self._word_infos[hi]['key']
+            else:
+                start_key = end_key = press['key']
+        else:
+            start_key = end_key = press['key']
+
+        # edit existing note at this exact span if it exists
+        existing = next(
+            (n for n in self._notes
+             if n.anchor_start == start_key and n.anchor_end == end_key),
+            None)
+        if existing:
+            self._start_edit(existing, is_new=False)
+            return
+
+        # create new note
+        new_note = CoachingNote(
+            anchor_start=start_key, anchor_end=end_key, text='')
+        self._notes.append(new_note)
+        self._relayout()
+        self._start_edit(new_note, is_new=True)
+
+    def contextMenuEvent(self, ev):
+        bi_info = self._bubble_at(ev.pos())
+        if not bi_info:
+            return
+        note = bi_info['note']
+        menu = QMenu(self)
+        edit_act   = menu.addAction('Edit note…')
+        delete_act = menu.addAction('Delete note')
+        chosen = menu.exec_(ev.globalPos())
+        if chosen == edit_act:
+            self._close_edit(commit=True)
+            self._start_edit(note, is_new=False)
+        elif chosen == delete_act:
+            self._close_edit(commit=True)
+            if note in self._notes:
+                self._notes.remove(note)
+            self._relayout()
+            self.notes_changed.emit()
+
+    # ── edit overlay ──────────────────────────────────────────────────────────
+
+    def _start_edit(self, note, is_new: bool):
+        # Safety: commit any lingering edit (focus-out usually handles this
+        # already, but guard for platform differences).
+        self._close_edit(commit=True)
+
+        self._edit_note   = note
+        self._edit_is_new = is_new
+
+        # find bubble rect (relayout first if note is freshly appended)
+        bi_info = next((b for b in self._bubble_infos if b['note'] is note), None)
+        if bi_info is None:
+            self._relayout()
+            bi_info = next(
+                (b for b in self._bubble_infos if b['note'] is note), None)
+        if bi_info is None:
+            # still no rect → unresolved anchor; bail
+            self._edit_note   = None
+            self._edit_is_new = False
+            return
+
+        rect = bi_info['rect']
+        ov   = _NoteEditOverlay(self)
+        ov.setFont(self._font())
+        ov.setPlainText(note.text)
+        ov.setGeometry(rect)
+        ov.commit_edit.connect(self._on_edit_done)
+        ov.show()
+        ov.raise_()
+        ov.setFocus()
+        if note.text:
+            ov.selectAll()
+        self._edit_ov = ov
+
+    def _on_edit_done(self, commit: bool):
+        self._close_edit(commit=commit)
+
+    def _close_edit(self, *, commit: bool):
+        ov = self._edit_ov
+        if ov is None:
+            return
+        # Prevent re-entry: block the overlay's signals and set _fired flag.
+        ov.blockSignals(True)
+        ov._fired = True
+        new_text = ov.toPlainText().strip()
+        ov.hide()
+        ov.deleteLater()
+        self._edit_ov = None
+
+        note   = self._edit_note
+        is_new = self._edit_is_new
+        self._edit_note   = None
+        self._edit_is_new = False
+
+        if note is None:
+            return
+
+        changed = False
+        if commit:
+            if new_text:
+                if note.text != new_text:
+                    note.text = new_text
+                    changed = True
+                elif is_new:
+                    changed = True   # even if text unchanged, new note was added
+            else:
+                # empty → delete
+                if note in self._notes:
+                    self._notes.remove(note)
+                    changed = True
+        else:
+            # cancel
+            if is_new and note in self._notes:
+                self._notes.remove(note)
+                # Don't emit notes_changed for an abandoned new note
+
+        self._relayout()
+        if changed:
+            self.notes_changed.emit()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._relayout()
+        # Keep edit overlay aligned if active
+        if self._edit_ov and self._edit_note:
+            bi_info = next(
+                (b for b in self._bubble_infos if b['note'] is self._edit_note),
+                None)
+            if bi_info:
+                self._edit_ov.setGeometry(bi_info['rect'])
+
+
+# =============================================================================
+# Interlinear IPA view — read-only, word on top, IPA beneath each word
+# =============================================================================
+
+class LyricsIpaView(QWidget):
+    """Read-only canvas showing each lyric word with its IPA directly beneath.
+
+    Words wrap line-by-line; each cell is max(word_width, ipa_width) so the
+    two rows stay aligned per word.  Clicking a word (not the IPA row) emits
+    word_clicked so the Analysis panel updates identically to the other views.
+    """
+
+    word_clicked = pyqtSignal(str, int, int)  # word_lower, block_number, char_offset
+
+    # ── layout constants ───────────────────────────────────────────────────
+    _MARGIN    = 14
+    _WORD_GAP  = 8    # horizontal gap between cells on the same row
+    _ROW_GAP   = 6    # extra vertical gap between wrapped rows
+    _BLOCK_GAP = 20   # gap between lyrics lines (blocks)
+    _IPA_GAP   = 2    # gap between word baseline and IPA top
+
+    # ── theme ──────────────────────────────────────────────────────────────
+    _C_BG    = '#14181f'
+    _C_TEXT  = '#d8dfe8'   # word color (reuse CoachingView._C_TEXT)
+    _C_MUTED = '#98a8c0'   # IPA color  (reuse CoachingView._C_MUTED)
+
+    def __init__(self):
+        super().__init__()
+        self._blocks: list = []   # list of per-line lists: (word, ipa, bn, co)
+        self._font_pt: int = 16
+        # Hit-test cache: list of (QRect, word_lower, bn, co) — word box only
+        self._word_rects: list = []
+        self._total_h: int = _scale(100)
+        self.setMouseTracking(True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    # ── public API ─────────────────────────────────────────────────────────
+
+    def set_view_data(self, blocks: list):
+        """*blocks*: list of per-line lists of (word, ipa_str, block_number, char_offset)."""
+        self._blocks = blocks
+        self._relayout()
+
+    def set_font_pt(self, pt: int):
+        self._font_pt = pt
+        self._relayout()
+
+    def sizeHint(self):
+        from PyQt5.QtCore import QSize
+        return QSize(max(200, self.width()), getattr(self, '_total_h', _scale(100)))
+
+    # ── fonts ──────────────────────────────────────────────────────────────
+
+    def _word_font(self) -> QFont:
+        return QFont('Inter', self._font_pt)
+
+    def _ipa_font(self) -> QFont:
+        return QFont('Charis SIL', max(8, self._font_pt - 3))
+
+    # ── layout ─────────────────────────────────────────────────────────────
+
+    def _relayout(self):
+        W = self.width()
+        if W <= 10:
+            self.update()
+            return
+
+        margin    = _scale(self._MARGIN)
+        word_gap  = _scale(self._WORD_GAP)
+        row_gap   = _scale(self._ROW_GAP)
+        block_gap = _scale(self._BLOCK_GAP)
+        ipa_gap   = _scale(self._IPA_GAP)
+        content_w = max(_scale(60), W - 2 * margin)
+
+        wfm  = QFontMetrics(self._word_font())
+        wlh  = wfm.height()
+        ifm  = QFontMetrics(self._ipa_font())
+        ilh  = ifm.height()
+        pair_h = wlh + ipa_gap + ilh
+
+        self._word_rects = []
+        y = _scale(12)
+
+        for line_list in self._blocks:
+            if not line_list:
+                y += block_gap
+                continue
+
+            # word-wrap into rows based on cell widths
+            rows: list = []
+            cur_row: list = []
+            cur_x = 0
+            for item in line_list:
+                word, ipa_str, bn, co = item
+                ww = wfm.horizontalAdvance(word)
+                iw = ifm.horizontalAdvance(ipa_str)
+                cell_w = max(ww, iw)
+                if cur_row and cur_x + word_gap + cell_w > content_w:
+                    rows.append(cur_row)
+                    cur_row = []
+                    cur_x = 0
+                cur_row.append((word, ipa_str, bn, co, ww, iw, cell_w))
+                cur_x += cell_w + word_gap
+            if cur_row:
+                rows.append(cur_row)
+
+            for row in rows:
+                x = margin
+                for (word, ipa_str, bn, co, ww, iw, cell_w) in row:
+                    # Only the word row is clickable
+                    self._word_rects.append(
+                        (QRect(x, y, cell_w, wlh), word.lower(), bn, co))
+                    x += cell_w + word_gap
+                y += pair_h + row_gap
+
+            y += block_gap - row_gap   # replace last row_gap with block_gap
+
+        self._total_h = y + _scale(12)
+        self.setMinimumHeight(self._total_h)
+        self.update()
+
+    # ── painting ───────────────────────────────────────────────────────────
+
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.fillRect(self.rect(), QColor(self._C_BG))
+
+        if not self._blocks:
+            p.setPen(QColor(self._C_MUTED))
+            p.setFont(self._word_font())
+            p.drawText(self.rect(), Qt.AlignCenter,
+                       'Switch to IPA view after entering lyrics.')
+            return
+
+        margin    = _scale(self._MARGIN)
+        word_gap  = _scale(self._WORD_GAP)
+        row_gap   = _scale(self._ROW_GAP)
+        block_gap = _scale(self._BLOCK_GAP)
+        ipa_gap   = _scale(self._IPA_GAP)
+        content_w = max(_scale(60), self.width() - 2 * margin)
+
+        wfont = self._word_font()
+        wfm   = QFontMetrics(wfont)
+        wlh   = wfm.height()
+        ifont = self._ipa_font()
+        ifm   = QFontMetrics(ifont)
+        ilh   = ifm.height()
+        pair_h = wlh + ipa_gap + ilh
+
+        y = _scale(12)
+        for line_list in self._blocks:
+            if not line_list:
+                y += block_gap
+                continue
+
+            rows: list = []
+            cur_row: list = []
+            cur_x = 0
+            for item in line_list:
+                word, ipa_str, bn, co = item
+                ww = wfm.horizontalAdvance(word)
+                iw = ifm.horizontalAdvance(ipa_str)
+                cell_w = max(ww, iw)
+                if cur_row and cur_x + word_gap + cell_w > content_w:
+                    rows.append(cur_row)
+                    cur_row = []
+                    cur_x = 0
+                cur_row.append((word, ipa_str, bn, co, ww, iw, cell_w))
+                cur_x += cell_w + word_gap
+            if cur_row:
+                rows.append(cur_row)
+
+            for row in rows:
+                x = margin
+                for (word, ipa_str, bn, co, ww, iw, cell_w) in row:
+                    # Word centered in its cell
+                    word_x = x + (cell_w - ww) // 2
+                    p.setFont(wfont)
+                    p.setPen(QColor(self._C_TEXT))
+                    p.drawText(word_x, y, ww + _scale(2), wlh,
+                               Qt.AlignLeft | Qt.AlignVCenter, word)
+                    # IPA centered beneath it
+                    ipa_x = x + (cell_w - iw) // 2
+                    p.setFont(ifont)
+                    p.setPen(QColor(self._C_MUTED))
+                    p.drawText(ipa_x, y + wlh + ipa_gap, iw + _scale(2), ilh,
+                               Qt.AlignLeft | Qt.AlignVCenter, ipa_str)
+                    x += cell_w + word_gap
+                y += pair_h + row_gap
+
+            y += block_gap - row_gap
+
+        p.end()
+
+    # ── hit-test / events ──────────────────────────────────────────────────
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._relayout()
+
+    def mousePressEvent(self, ev):
+        if ev.button() != Qt.LeftButton:
+            return
+        pos = ev.pos()
+        for (rect, word_lower, bn, co) in self._word_rects:
+            if rect.contains(pos):
+                self.word_clicked.emit(word_lower, bn, co)
+                return
 
 
 class VowelChartView(QWidget):
@@ -1859,28 +2954,42 @@ class ArticulationCard(QFrame):
         self.title = QLabel('Select a vowel above')
         self.title.setObjectName('CardTitle')
         self.title.setWordWrap(True)
+        self.title.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.subtitle = QLabel('')
         self.subtitle.setObjectName('CardLine')
         self.subtitle.setWordWrap(True)
+        self.subtitle.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.tongue = QLabel('')
         self.tongue.setObjectName('CardLine')
         self.tongue.setWordWrap(True)
+        self.tongue.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.lips = QLabel('')
         self.lips.setObjectName('CardLine')
         self.lips.setWordWrap(True)
+        self.lips.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.brightness_bar = BrightnessBar()
         self.notes = QLabel('')
         self.notes.setObjectName('CardNotes')
         self.notes.setWordWrap(True)
+        self.notes.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
 
         self.stress_warning = QLabel('')
         self.stress_warning.setObjectName('StressWarning')
         self.stress_warning.setWordWrap(True)
+        self.stress_warning.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.stress_warning.setVisible(False)
 
         self.sustained_label = QLabel('')
         self.sustained_label.setObjectName('LegatoTip')
         self.sustained_label.setWordWrap(True)
+        self.sustained_label.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.sustained_label.setVisible(False)
 
         self.section_header = QLabel('MODIFICATION AT HIGH PITCH')
@@ -1888,6 +2997,8 @@ class ArticulationCard(QFrame):
         self.section_caption = QLabel('')
         self.section_caption.setObjectName('Caption')
         self.section_caption.setWordWrap(True)
+        self.section_caption.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
 
         self.ladder_row = QHBoxLayout()
         self.ladder_row.setSpacing(_scale(8))
@@ -2147,6 +3258,8 @@ class AnalysisPanel(QWidget):
         wh_layout.setSpacing(_scale(8))
         self.word_label = QLabel('Click a word to begin')
         self.word_label.setObjectName('WordLabel')
+        self.word_label.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.speak_btn = QPushButton('▶ Speak')
         self.speak_btn.setFixedHeight(_scale(28))
         self.speak_btn.setEnabled(False)
@@ -2158,15 +3271,21 @@ class AnalysisPanel(QWidget):
         self.ipa_label.setObjectName('IpaLabel')
         self.ipa_label.setTextFormat(Qt.RichText)
         self.ipa_label.setWordWrap(True)
+        self.ipa_label.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
 
         self.legato_tip = QLabel('')
         self.legato_tip.setObjectName('LegatoTip')
         self.legato_tip.setWordWrap(True)
+        self.legato_tip.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.legato_tip.setVisible(False)
 
         self.consonant_tip = QLabel('')
         self.consonant_tip.setObjectName('ConsonantTip')
         self.consonant_tip.setWordWrap(True)
+        self.consonant_tip.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.consonant_tip.setVisible(False)
 
         alt_header = QLabel('PRONUNCIATIONS')
@@ -2626,6 +3745,46 @@ class BulkImportDialog(QDialog):
             return None
 
 
+
+class _CoachingImportDialog(QDialog):
+    """Paste-in dialog for importing a NOTES-FOR-IMPORT block from the
+    Direction Prompt output."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Import Coaching Notes')
+        self.setMinimumSize(_scale(560), _scale(380))
+
+        info = QLabel(
+            'Paste the full output from the Direction Prompt AI response below. '
+            'The importer will find the <b>NOTES-FOR-IMPORT</b> block at the end '
+            'and extract the coaching notes from it.<br>'
+            '<span style="color:#98a8c0;font-style:italic;font-size:11px">'
+            'The block starts with <code>NOTES-FOR-IMPORT</code> and the JSON '
+            'is surrounded by <code>&lt;&lt;&lt;</code> and '
+            '<code>&gt;&gt;&gt;</code>.</span>')
+        info.setTextFormat(Qt.RichText)
+        info.setWordWrap(True)
+
+        self.edit = QPlainTextEdit()
+        self.edit.setPlaceholderText(
+            'Paste the AI response here…\n\n'
+            'NOTES-FOR-IMPORT\n'
+            '<<<\n'
+            '{"notes": [{"anchor": "…", "note": "…"}, …]}\n'
+            '>>>')
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.Cancel | QDialogButtonBox.Ok)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(info)
+        layout.addWidget(self.edit, 1)
+        layout.addWidget(btns)
+
+
 # =============================================================================
 # Main window
 # =============================================================================
@@ -2669,6 +3828,7 @@ class MainWindow(QMainWindow):
 
         self._editor_font_size = 16
         self._ui_scale: float = 1.0  # adjusted via View → Adjust UI Scale
+        self._hint_opacity: float = 0.5  # hint-highlight blend opacity [0.0, 1.0]
         self._annotations_enabled = True
         self._enabled_hint_types = {'legato','vowel_glide','crash','r_toxicity','dark_l','glottal','plosive','nasal','approx','fricative','yod','ng_release','diphthong','aspiration'}
         self._word_annotations = []
@@ -2742,8 +3902,71 @@ class MainWindow(QMainWindow):
         self.style_btn.setMenu(self._style_menu)
         lh_layout.addWidget(self.style_btn)
         lh_layout.addWidget(self.hints_btn)
+
+        # Three-way mutually-exclusive view buttons: Lyrics / Notes / IPA
+        from PyQt5.QtWidgets import QButtonGroup
+        self._view_btn_group = QButtonGroup(self)
+        self._view_btn_group.setExclusive(True)
+
+        self.lyrics_view_btn = QToolButton()
+        self.lyrics_view_btn.setObjectName('HintsToggle')
+        self.lyrics_view_btn.setFixedHeight(_scale(22))
+        self.lyrics_view_btn.setCheckable(True)
+        self.lyrics_view_btn.setChecked(True)
+        self.lyrics_view_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.lyrics_view_btn.setText('Lyrics')
+        self.lyrics_view_btn.setToolTip('Show the live lyrics editor (page 0).')
+
+        self.coaching_btn = QToolButton()
+        self.coaching_btn.setObjectName('HintsToggle')
+        self.coaching_btn.setFixedHeight(_scale(22))
+        self.coaching_btn.setCheckable(True)
+        self.coaching_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.coaching_btn.setText('Notes')
+        self.coaching_btn.setToolTip(
+            'Coaching Notes mode — attach performance notes to words or spans. '
+            'Lyrics become read-only while active.')
+
+        self.ipa_view_btn = QToolButton()
+        self.ipa_view_btn.setObjectName('HintsToggle')
+        self.ipa_view_btn.setFixedHeight(_scale(22))
+        self.ipa_view_btn.setCheckable(True)
+        self.ipa_view_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.ipa_view_btn.setText('IPA')
+        self.ipa_view_btn.setToolTip(
+            'Interlinear IPA view — shows each word with its IPA printed beneath.')
+
+        self._view_btn_group.addButton(self.lyrics_view_btn, 0)
+        self._view_btn_group.addButton(self.coaching_btn,    1)
+        self._view_btn_group.addButton(self.ipa_view_btn,    2)
+        self._view_btn_group.buttonClicked.connect(self._on_view_btn_clicked)
+
+        lh_layout.addWidget(self.lyrics_view_btn)
+        lh_layout.addWidget(self.coaching_btn)
+        lh_layout.addWidget(self.ipa_view_btn)
         ec_layout.addWidget(lyrics_header)
-        ec_layout.addWidget(self.editor, 1)
+
+        # Stack: page 0 = live editor, page 1 = coaching view, page 2 = IPA view
+        self.coaching_view = CoachingView()
+        self.coaching_view.notes_changed.connect(self._schedule_save)
+        self.coaching_view.word_clicked.connect(self._on_word_clicked)
+        coaching_scroll = QScrollArea()
+        coaching_scroll.setWidgetResizable(True)
+        coaching_scroll.setFrameShape(QFrame.NoFrame)
+        coaching_scroll.setWidget(self.coaching_view)
+
+        self.ipa_view = LyricsIpaView()
+        self.ipa_view.word_clicked.connect(self._on_word_clicked)
+        ipa_scroll = QScrollArea()
+        ipa_scroll.setWidgetResizable(True)
+        ipa_scroll.setFrameShape(QFrame.NoFrame)
+        ipa_scroll.setWidget(self.ipa_view)
+
+        self.lyrics_stack = QStackedWidget()
+        self.lyrics_stack.addWidget(self.editor)       # page 0
+        self.lyrics_stack.addWidget(coaching_scroll)   # page 1
+        self.lyrics_stack.addWidget(ipa_scroll)        # page 2
+        ec_layout.addWidget(self.lyrics_stack, 1)
 
         traj_title = QLabel('PHRASE TRAJECTORY')
         traj_title.setObjectName('PanelTitle')
@@ -2836,6 +4059,9 @@ class MainWindow(QMainWindow):
         a = QAction('Generate &Direction Prompt to Clipboard', self)
         a.triggered.connect(self._on_generate_direction_prompt)
         s.addAction(a)
+        a = QAction('&Import Coaching Notes…', self)
+        a.triggered.connect(self._on_import_coaching_notes)
+        s.addAction(a)
         s.addSeparator()
         a = QAction('Export Cheat Sheet (Markdown)...', self)
         a.triggered.connect(lambda: self._on_export_cheat_sheet('md'))
@@ -2859,6 +4085,9 @@ class MainWindow(QMainWindow):
         a = QAction('Adjust &UI Scale…', self)
         a.triggered.connect(self._adjust_ui_scale)
         s.addAction(a)
+        a = QAction('Adjust Hint Highlight &Opacity…', self)
+        a.triggered.connect(self._adjust_hint_opacity)
+        s.addAction(a)
 
     def _apply_editor_font(self):
         """Set lyrics editor font via a widget-level stylesheet so it
@@ -2868,6 +4097,10 @@ class MainWindow(QMainWindow):
         self.editor.setStyleSheet(
             f"QTextEdit {{ font-size: {self._editor_font_size}pt; }}"
         )
+        if hasattr(self, 'coaching_view'):
+            self.coaching_view.set_font_pt(self._editor_font_size)
+        if hasattr(self, 'ipa_view'):
+            self.ipa_view.set_font_pt(self._editor_font_size)
 
     def _adjust_ui_scale(self):
         """Let the user scale the whole UI (layout + fonts) as a percentage.
@@ -2899,6 +4132,55 @@ class MainWindow(QMainWindow):
             self._editor_font_size = new
             self._apply_editor_font()
 
+    def _adjust_hint_opacity(self):
+        """Open a live-preview slider dialog for hint-highlight opacity."""
+        from PyQt5.QtWidgets import QSlider, QDialogButtonBox as _DBB
+        original = self._hint_opacity
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Hint Highlight Opacity')
+        dlg.setMinimumWidth(_scale(320))
+
+        desc = QLabel(
+            'Adjust how strongly the background colour behind each '
+            'annotated word is shown.\n'
+            '0% = underline only (invisible tint), '
+            '100% = full tint colour.')
+        desc.setWordWrap(True)
+
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, 100)
+        slider.setValue(round(original * 100))
+        slider.setTickPosition(QSlider.TicksBelow)
+        slider.setTickInterval(10)
+
+        pct_label = QLabel(f'{slider.value()}%')
+        pct_label.setAlignment(Qt.AlignCenter)
+
+        def _on_slider(v):
+            pct_label.setText(f'{v}%')
+            self.editor.set_highlight_opacity(v / 100.0)
+
+        slider.valueChanged.connect(_on_slider)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(_scale(16), _scale(16), _scale(16), _scale(12))
+        layout.setSpacing(_scale(10))
+        layout.addWidget(desc)
+        layout.addWidget(slider)
+        layout.addWidget(pct_label)
+        layout.addWidget(btns)
+
+        if dlg.exec_() == QDialog.Accepted:
+            self._hint_opacity = slider.value() / 100.0
+        else:
+            # Restore original value on cancel
+            self.editor.set_highlight_opacity(original)
+            self._hint_opacity = original
+
     # ---- Song handling ----
 
     @property
@@ -2924,6 +4206,13 @@ class MainWindow(QMainWindow):
         self._current_char_offset = -1
         self._vowel_seq_active = False
         self._update_missing_ipa_indicator()
+        if hasattr(self, 'coaching_view'):
+            self.coaching_view.set_song(song)
+        # Always return to the lyrics editor when switching songs
+        if hasattr(self, 'lyrics_stack'):
+            self.lyrics_stack.setCurrentIndex(0)
+        if hasattr(self, '_view_btn_group'):
+            self.lyrics_view_btn.setChecked(True)
 
     def _on_song_changed(self, idx):
         if idx < 0 or idx >= len(self.songs) or idx == self.active_index:
@@ -2932,6 +4221,34 @@ class MainWindow(QMainWindow):
         self.active_index = idx
         self._load_active_song()
         self._schedule_save()
+
+    def _on_view_btn_clicked(self, btn):
+        """Three-way view switch: Lyrics (0), Notes (1), IPA (2)."""
+        idx = self._view_btn_group.id(btn)
+        if idx == 0:
+            # Lyrics editor — just show it
+            self.lyrics_stack.setCurrentIndex(0)
+        elif idx == 1:
+            # Notes / coaching view — flush editor text first
+            self.active_song.lyrics = self.editor.toPlainText()
+            self.coaching_view.set_song(self.active_song)
+            self.lyrics_stack.setCurrentIndex(1)
+        elif idx == 2:
+            # Interlinear IPA view — flush editor text, rebuild view data
+            self.active_song.lyrics = self.editor.toPlainText()
+            blocks = self._build_ipa_view_data()
+            self.ipa_view.set_view_data(blocks)
+            self.lyrics_stack.setCurrentIndex(2)
+
+    def _on_coaching_toggle(self, checked: bool):
+        """Switch between the live editor (page 0) and the coaching view (page 1).
+        Kept for backward compatibility; the main UI now uses _on_view_btn_clicked."""
+        if checked:
+            self.active_song.lyrics = self.editor.toPlainText()
+            self.coaching_view.set_song(self.active_song)
+            self.lyrics_stack.setCurrentIndex(1)
+        else:
+            self.lyrics_stack.setCurrentIndex(0)
 
     def _on_new_song(self):
         name, ok = QInputDialog.getText(
@@ -2973,6 +4290,11 @@ class MainWindow(QMainWindow):
         self.active_song.lyrics = self.editor.toPlainText()
         self._schedule_save()
         self._annotation_timer.start()
+        # If IPA view is currently shown, keep it in sync
+        if (hasattr(self, 'lyrics_stack') and
+                self.lyrics_stack.currentIndex() == 2):
+            blocks = self._build_ipa_view_data()
+            self.ipa_view.set_view_data(blocks)
 
     def _schedule_save(self):
         self._save_timer.start()
@@ -3028,6 +4350,9 @@ class MainWindow(QMainWindow):
         if self._current_block_number >= 0:
             self._update_trajectory(self.editor.line_text(self._current_block_number),
                                     self._current_char_offset)
+        if (hasattr(self, 'lyrics_stack') and
+                self.lyrics_stack.currentIndex() == 2):
+            self.ipa_view.set_view_data(self._build_ipa_view_data())
 
     def _context_aware_pronunciations(self, word, next_ipa=None):
         """Apply next-word context rules to select a pronunciation.
@@ -3818,7 +5143,8 @@ class MainWindow(QMainWindow):
             f"guess — a wrong attribution corrupts everything that follows.\n\n"
             f"{step_b}"
             f"With those resolved, respond in plain prose under the numbered "
-            f"section headers below. No JSON, no code fences, no markdown tables. "
+            f"section headers below. No JSON, no code fences, no markdown tables "
+            f"in sections 1–8. "
             f"Cite recordings as performer + year + medium (cast album, film, "
             f"broadcast), and only cite ones you are confident are real. If a "
             f"section does not apply, say so briefly rather than padding.\n\n"
@@ -3886,16 +5212,156 @@ class MainWindow(QMainWindow):
             f"Common mistakes specific to this song and role — rushed phrases, "
             f"misplaced emphases, vowel traps, clichéd dramatic choices. For each, "
             f"name the word or line, say why the mistake happens, and what to do "
-            f"instead."
+            f"instead.\n\n"
+            f"After the eight prose sections, output exactly one import block — "
+            f"this only, nothing after it:\n"
+            f"NOTES-FOR-IMPORT\n"
+            f"<<<\n"
+            + '{"notes": [{"anchor": "<span copied verbatim from the lyrics>",'
+              ' "note": "<short direction>"}]}\n'
+            + f">>>\n\n"
+            f"Rules for the import block: anchor must be copied verbatim from "
+            f"the lyrics between the <lyrics> markers above (same words, "
+            f"capitalisation, punctuation) so it matches by exact text. Prefer "
+            f"the shortest unambiguous span; extend with a neighbouring word if "
+            f"the span repeats elsewhere. note is one actionable direction under "
+            f"~15 words (e.g. 'go loud', 'darken the vowel', 'spit the "
+            f"consonant'). Draw 5\u201320 notes from sections 4 and 5 only. "
+            f"This JSON block is the only place JSON is allowed in your response."
         )
 
         QApplication.clipboard().setText(prompt)
         QMessageBox.information(
             self, 'Direction Prompt Copied',
-            "A research and direction prompt has been copied to your "
-            "clipboard.\n\nPaste it into an AI assistant and read the prose it "
-            "returns. This output is for your own study — it is not in a format "
-            "for Song \u2192 Bulk Import IPAs.")
+            "A research and direction prompt has been copied to your clipboard.\n\n"
+            "Paste it into an AI assistant. After the eight prose sections the "
+            "response will contain a NOTES-FOR-IMPORT block that you can bring "
+            "in via Song \u2192 Import Coaching Notes\u2026")
+
+    def _on_import_coaching_notes(self):
+        """Open paste dialog, parse NOTES-FOR-IMPORT block, append CoachingNotes."""
+        if not self.active_song:
+            QMessageBox.information(self, 'No Song', 'No active song to import into.')
+            return
+
+        dlg = _CoachingImportDialog(self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        raw = dlg.edit.toPlainText()
+
+        # Extract JSON between <<< and >>>
+        import re as _re
+        m = _re.search(r'<<<\s*(.*?)\s*>>>', raw, _re.DOTALL)
+        if not m:
+            QMessageBox.warning(
+                self, 'Import Failed',
+                'No NOTES-FOR-IMPORT block found.\n\n'
+                'Make sure the text contains the block delimited by '
+                '<<< and >>>.')
+            return
+
+        json_text = m.group(1).strip()
+        try:
+            import json as _json
+            data = _json.loads(json_text)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, 'Import Failed',
+                f'Could not parse the JSON block:\n{exc}')
+            return
+
+        notes_raw = data.get('notes', [])
+        if not isinstance(notes_raw, list):
+            QMessageBox.warning(self, 'Import Failed',
+                                'Expected a JSON object with a "notes" list.')
+            return
+
+        lyrics = self.active_song.lyrics
+        occ = word_occurrences(lyrics)  # list of (match, "word#N")
+
+        matched = 0
+        ambiguous = 0
+        unmatched_anchors = []
+
+        for entry in notes_raw:
+            anchor = (entry.get('anchor') or '').strip()
+            note_text = (entry.get('note') or '').strip()
+            if not anchor or not note_text:
+                continue
+
+            # Case-sensitive search first, then case-insensitive fallback
+            idx = lyrics.find(anchor)
+            if idx == -1:
+                idx = lyrics.lower().find(anchor.lower())
+                if idx == -1:
+                    unmatched_anchors.append(anchor)
+                    continue
+
+            span_end = idx + len(anchor)
+
+            # Check for a second occurrence (ambiguity)
+            second = lyrics.find(anchor, idx + 1)
+            if second == -1:
+                second = lyrics.lower().find(anchor.lower(), idx + 1)
+            is_ambiguous = second != -1
+
+            # Map char span → word#N keys via word_occurrences
+            # Find the first word whose start >= idx and last word whose end <= span_end
+            start_key = None
+            end_key = None
+            for wm, wkey in occ:
+                ws, we = wm.start(), wm.end()
+                # start_key: first word that overlaps or starts within anchor
+                if start_key is None and we > idx:
+                    start_key = wkey
+                # end_key: last word whose start is before span_end
+                if ws < span_end:
+                    end_key = wkey
+
+            if start_key is None or end_key is None:
+                unmatched_anchors.append(anchor)
+                continue
+
+            self.active_song.coaching_notes.append(
+                CoachingNote(start_key, end_key, note_text))
+
+            if is_ambiguous:
+                ambiguous += 1
+            else:
+                matched += 1
+
+        # Refresh coaching view and persist
+        if hasattr(self, 'coaching_view'):
+            self.coaching_view.set_song(self.active_song)
+        self._schedule_save()
+
+        # Build report
+        total_placed = matched + ambiguous
+        lines = [f'Imported {total_placed} note(s).']
+        if ambiguous:
+            lines.append(
+                f'{ambiguous} anchor(s) appeared more than once in the lyrics '
+                f'— the first occurrence was used.')
+        if unmatched_anchors:
+            lines.append(
+                f'{len(unmatched_anchors)} anchor(s) could not be found '
+                f'and were not imported:')
+            for a in unmatched_anchors:
+                lines.append(f'  • {a}')
+            lines.append(
+                '\nYou can add these manually in Coaching Notes mode '
+                'by clicking the relevant word(s).')
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle('Import Complete')
+        msg.setIcon(QMessageBox.Information if not unmatched_anchors
+                    else QMessageBox.Warning)
+        msg.setText('\n'.join(lines))
+        # Make text selectable so user can copy unmatched anchors
+        for lbl in msg.findChildren(QLabel):
+            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        msg.exec_()
 
     def _on_open_save_folder(self):
         path_ = self.store.dir
@@ -3941,6 +5407,11 @@ class MainWindow(QMainWindow):
                         if key:
                             act.setChecked(key in self._enabled_hint_types)
         self._update_hints_btn_label()
+        # Persist hint-highlight opacity
+        saved_opacity = self.settings.value('hintOpacity', None)
+        if saved_opacity is not None:
+            self._hint_opacity = max(0.0, min(1.0, float(saved_opacity)))
+        self.editor.set_highlight_opacity(self._hint_opacity)
         # Persist Play-line-vowels gap speed
         saved_gap = self.settings.value('seqGapMs', None)
         if saved_gap is not None:
@@ -3958,26 +5429,25 @@ class MainWindow(QMainWindow):
             self._seq_speed_combo.blockSignals(False)
 
 
-    def _line_to_ipa(self, line_text: str, line_base: int = -1) -> str:
-        """Render a line of lyrics as IPA, preserving punctuation and spacing.
+    def _line_to_ipa_words(self, line_text: str,
+                            line_base: int = -1) -> list:
+        """Return (word, ipa_string, char_offset_in_line) for each WORD_RE match.
 
-        Uses the same context-aware pronunciation logic as the trajectory bar
-        (function-word reductions, custom IPA overrides, and the user's
-        preferred-pronunciation choice per occurrence). *line_base* is the
-        absolute offset of this line within the full lyrics; when given, the
-        user's per-occurrence pronunciation choices are honoured.
+        ipa_string is the bare pronunciation WITHOUT slashes (the caller adds
+        them as needed).  Words with no pronunciation get '?' as the ipa_string.
+        Uses the identical context-aware logic as the trajectory bar:
+        per-occurrence _preferred_index, next-word next_ipa resolution,
+        _context_aware_pronunciations, and custom IPA.  This is the single
+        source of truth for per-word IPA so both _line_to_ipa and the
+        LyricsIpaView read from here.
         """
         matches = list(WORD_RE.finditer(line_text))
-        if not matches:
-            return line_text  # punctuation/whitespace only — pass through
-        parts = []
-        last_end = 0
+        result = []
         for i, m in enumerate(matches):
-            parts.append(line_text[last_end:m.start()])
             w = m.group()
             wl = w.lower()
             abs_start = (line_base + m.start()) if line_base >= 0 else -1
-            # Next word's IPA for the/to vowel-vs-consonant resolution
+            # Next-word IPA for context-aware function-word resolution (the/to)
             next_ipa = None
             if i + 1 < len(matches):
                 nxt = matches[i + 1]
@@ -3990,12 +5460,58 @@ class MainWindow(QMainWindow):
             if prons:
                 preferred = self._preferred_index(wl, abs_start)
                 pron = prons[min(preferred, len(prons) - 1)]
-                parts.append(f'/{pron}/')
             else:
+                pron = '?'
+            result.append((w, pron, m.start()))
+        return result
+
+    def _line_to_ipa(self, line_text: str, line_base: int = -1) -> str:
+        """Render a line of lyrics as IPA, preserving punctuation and spacing.
+
+        Delegates per-word IPA resolution to _line_to_ipa_words so both
+        this method and LyricsIpaView share the same single source of truth.
+        *line_base* is the absolute offset of this line within the full lyrics;
+        when given, per-occurrence pronunciation choices are honoured.
+        """
+        word_list = self._line_to_ipa_words(line_text, line_base)
+        if not word_list:
+            return line_text  # punctuation/whitespace only — pass through
+        matches = list(WORD_RE.finditer(line_text))
+        parts = []
+        last_end = 0
+        for (w, pron, _co), m in zip(word_list, matches):
+            parts.append(line_text[last_end:m.start()])
+            if pron == '?':
                 parts.append(f'/{w}?/')
+            else:
+                parts.append(f'/{pron}/')
             last_end = m.end()
         parts.append(line_text[last_end:])
         return ''.join(parts)
+
+    def _build_ipa_view_data(self) -> list:
+        """Build the blocks structure for LyricsIpaView.set_view_data.
+
+        Returns a list of per-line lists; each inner list contains
+        (word, ipa_str, block_number, char_offset_in_line) for every word
+        on that line.  Blank lines produce an empty inner list so spacing
+        is preserved.  Uses the same line_base tracking as _build_cheat_sheet_data.
+        """
+        song = self.active_song
+        blocks = []
+        line_base = 0
+        for bn, raw_line in enumerate(song.lyrics.splitlines()):
+            if raw_line.strip():
+                word_list = self._line_to_ipa_words(raw_line, line_base)
+                line_data = [
+                    (w, pron, bn, co)
+                    for (w, pron, co) in word_list
+                ]
+                blocks.append(line_data)
+            else:
+                blocks.append([])
+            line_base += len(raw_line) + 1  # +1 for the newline separator
+        return blocks
 
     def _build_cheat_sheet_data(self) -> dict:
         """Build structured cheat sheet data shared by all export formats.
@@ -4291,6 +5807,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue('windowState', self.saveState())
         self.settings.setValue('editorFontSize', self._editor_font_size)
         self.settings.setValue('uiScale', self._ui_scale)
+        self.settings.setValue('hintOpacity', self._hint_opacity)
         self.settings.setValue('enabledHintTypes', list(self._enabled_hint_types))
         super().closeEvent(event)
 
@@ -4326,6 +5843,9 @@ def main():
     # ── HiDPI flags must come before QApplication() ───────────────────────────
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    # Sweep any TTS temp files left over from a previous crash
+    _tts_cleanup()
 
     # On Windows, set an explicit AppUserModelID so the taskbar shows our icon
     # and groups the window under this app rather than the python launcher.
