@@ -15,21 +15,31 @@ Download the latest `.exe` from the [releases page](../../releases). No installa
 ## Quick start
 
 1. Pick or create a song slot from the dropdown at the top of the lyrics panel
-2. Paste your lyrics
-3. Click any word to open its analysis on the right
-4. Coloured highlights appear on words with diction notes; hover to read them
+2. Paste your lyrics in the **Lyrics** view
+3. Click any word in any view to open its analysis on the right
+4. Coloured highlights appear on words with diction notes; hover over a word to read its tip, or click the word to see it in the right panel — panel tips are selectable and copyable
 
 ---
 
 ## Lyrics panel
 
-**Click a word** to open its full analysis in the right panel.
+### Views
+
+Three mutually exclusive view buttons in the lyrics header switch the main canvas:
+
+- **Lyrics** — the editable canvas; paste and edit text here.
+- **Notes** — read-only coaching mode: drag across a word or span to attach a short performance note; it appears as a sticky-note bubble beneath the line. Click a bubble to edit, right-click to delete.
+- **IPA** — read-only view showing the lyrics with each word's IPA printed directly beneath it, line by line.
+
+Clicking a word in **any** view opens that word's full analysis in the right panel and updates the phrase trajectory.
 
 **Right-click a word** for:
 
-- *Set custom IPA* - override the dictionary pronunciation. Useful for proper nouns, foreign words, and numbers. Enter without slashes, e.g. `valʒɑ̃` not `/valʒɑ̃/`
-- *Toggle sustained note* - marks a word for long-note tips in the analysis panel (vibrato handling, vowel-specific warnings)
-- *Dismiss hint* - hides the inline annotation for that word permanently for this song
+- *Set custom IPA* — override the dictionary pronunciation. Useful for proper nouns, foreign words, and numbers. Enter without slashes, e.g. `valʒɑ̃` not `/valʒɑ̃/`. Words with accents or diacritics (résumé, über, caffè) are recognised as whole words and can be clicked and right-clicked the same way. The built-in dictionary won't transcribe most foreign words — set a custom IPA for those.
+- *Toggle sustained note* — marks a word for long-note tips in the analysis panel (vibrato handling, vowel-specific warnings)
+- *Dismiss hint* — hides the inline annotation for that word permanently for this song
+
+**Missing-IPA indicator** — a button that appears in the lyrics header when some words have no IPA pronunciation. Click it to review the list and start the IPA-prompt flow.
 
 **CLASSICAL / MT/CCM button** sets the singing style for the active song. Affects how aggressive certain tips are: R toxicity is a hard warning in classical mode, a soft note in MT/CCM; vowel-to-vowel glide insertion is presented as standard practice in MT/CCM and as one option among two in classical.
 
@@ -37,18 +47,22 @@ Download the latest `.exe` from the [releases page](../../releases). No installa
 
 **Song menu:**
 
-- *Bulk Import IPAs* - paste a JSON object like `{"valjean": "valʒɑ̃", "cosette": "kɔzɛt"}` to set multiple custom pronunciations at once
-- *Generate IPA Prompt to Clipboard* - scans the lyrics for unrecognised words and builds a prompt you can paste into an AI; import the returned JSON via Bulk Import
-- *Reset Dismissed Hints* - restores all dismissed annotations for the active song
-- *Open Save Folder* - opens the folder containing `songs.json`
+- *Bulk Import IPAs* — paste a JSON object of word→IPA to set many custom pronunciations at once.
+- *Generate IPA Prompt to Clipboard* — scans the lyrics for unrecognised words and builds a prompt to paste into an AI; import the returned JSON via Bulk Import.
+- *Check for Missing IPAs* — lists words with no IPA and offers to generate that prompt for them.
+- *Generate Direction Prompt to Clipboard* — builds a research-and-performance-direction prompt for an AI. You can optionally name the character or voice part you're singing; the prompt includes the pronunciations you've already fixed and your sustained-word marks, and asks the AI to end its reply with a NOTES-FOR-IMPORT block.
+- *Import Coaching Notes* — paste the AI's reply from the Direction Prompt; the importer finds the NOTES-FOR-IMPORT block and adds those notes to the Notes view.
+- *Export Cheat Sheet (Markdown / PDF)* — exports the lyrics with IPA beneath each line plus a word-reference table (IPA, sustained marks, and diction tips).
+- *Reset Dismissed Hints* — restores all dismissed annotations for the active song.
+- *Open Save Folder* — opens the folder containing `songs.json`.
 
-**View menu** has font size and UI scale controls. Both persist across restarts.
+**View menu** has font size, UI scale, and hint-highlight opacity controls. The opacity slider tones down the inline highlight background colours when many hint types are active; the underline still flags the word even at low opacity. All three settings persist across restarts.
 
 ---
 
 ## Inline hint types
 
-Background tints on words in the lyrics. Hover to read the tip. Right-click to dismiss.
+Background tints on words in the lyrics. Hover to read the tip; right-click to dismiss. The highlight intensity is adjustable via the View-menu opacity slider — the underline still flags the word even at low opacity.
 
 | Colour | Type | What it flags |
 |---|---|---|
@@ -73,6 +87,8 @@ Punctuation (`,;:.!?`) suppresses legato tips at phrase boundaries. "the" automa
 
 A colour bar below the lyrics showing every vowel in the current line, warm for bright vowels and cool for dark ones. Gaps separate words. Click a syllable vowel button in the analysis panel to highlight its position in the bar.
 
+**Play line vowels** — plays every vowel in the current line in order through the TTS engine. The **Gap** selector beside it sets the pause between vowels during playback.
+
 Two warnings appear below when triggered:
 
 - **Chiaroscuro** - line average brightness is very skewed; suggests how to counter-balance
@@ -84,20 +100,22 @@ Both thresholds are rough heuristics. Treat them as prompts, not rules.
 
 ## Analysis panel
 
-**Speak button** - reads the word using the currently selected pronunciation. Uses SAPI SSML with IPA input on Windows, so custom pronunciations like `valʒɑ̃` are passed directly to the synthesiser rather than guessed from spelling.
+**Speak button** — reads the word using the currently selected pronunciation. Uses SAPI SSML with IPA input on Windows, so custom pronunciations like `valʒɑ̃` are passed directly to the synthesiser rather than guessed from spelling.
 
-**PRONUNCIATIONS** - multiple pronunciations shown with brightness tags. Click to select. Preference is saved per song.
+**Play vowel sound** — plays the currently selected vowel through the same TTS engine.
 
-**SYLLABLE VOWELS** - one button per vowel in the selected pronunciation. Clicking highlights that vowel on the chart and in the trajectory bar.
+**PRONUNCIATIONS** — multiple pronunciations shown with brightness tags. Click to select. Preference is saved per song.
 
-**Vowel chart** - IPA trapezoid with the selected vowel highlighted. High-pitch modification targets shown with a dashed arrow. Diphthongs show the sustain-to-glide arc.
+**SYLLABLE VOWELS** — one button per vowel in the selected pronunciation. Clicking highlights that vowel on the chart and in the trajectory bar.
 
-**Articulation card** - tongue position, lip shape, brightness bar, singing notes. Shows a stress warning when the selected vowel is on an unstressed syllable. If the word is marked as sustained (right-click in the lyrics), a sustained-note section appears with vowel-specific tips and vibrato notes.
+**Vowel chart** — IPA trapezoid with the selected vowel highlighted. High-pitch modification targets shown with a dashed arrow. Diphthongs show the sustain-to-glide arc.
 
-**Panel tips** - same text as the hover tooltip for the current word, so you can read it without going back to the lyrics.
+**Articulation card** — tongue position, lip shape, brightness bar, singing notes. Shows a stress warning when the selected vowel is on an unstressed syllable. If the word is marked as sustained (right-click in the lyrics), a sustained-note section appears with vowel-specific tips and vibrato notes.
+
+**Panel tips** — same text as the hover tooltip for the current word, so you can read it without going back to the lyrics.
 
 ---
 
 ## Save data
 
-Each song slot remembers lyrics, custom IPA overrides, preferred pronunciations, dismissed hints, sustained word marks, and the style setting. Everything is stored in a single `songs.json` file. Use **Song > Open Save Folder** to locate it.
+Each song slot remembers lyrics, custom IPA overrides, preferred pronunciations, dismissed hints, sustained word marks, coaching notes, and the style setting. Everything is stored in a single `songs.json` file. A rolling backup, `songs.bak.json`, is written alongside it before each save as a safety net against accidental edits. Use **Song > Open Save Folder** to locate them.
