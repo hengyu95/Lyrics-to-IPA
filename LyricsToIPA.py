@@ -1167,20 +1167,22 @@ def create_vowel_chart_svg(highlight: Optional[str] = None) -> str:
                          stroke_dasharray='2,3'))
 
     for sym, v in VOWELS.items():
+        if sym in ('ɚ', 'ɝ'):   # same coords as ə/ɜ; skip to avoid double-rendering
+            continue
         dx = 8 if v.rounded else -8
         dwg.add(dwg.text(sym, insert=(v.x + dx, v.y + 5),
                          text_anchor='middle',
                          font_family='Charis SIL, Doulos SIL, Calibri, serif',
-                         font_size='14', fill='#b8c0d0'))
+                         font_size='16', fill='#b8c0d0'))
 
     for x, txt in [(25, 'front'), (137, 'central'), (250, 'back')]:
         dwg.add(dwg.text(txt, insert=(x, -28), text_anchor='middle',
-                         font_size='11', fill='#7888a0',
+                         font_size='12', fill='#7888a0',
                          font_family='Inter, Segoe UI, sans-serif',
                          letter_spacing='1'))
     for y, txt in [(0, 'close'), (150, 'mid'), (300, 'open')]:
         dwg.add(dwg.text(txt, insert=(-18, y + 4), text_anchor='end',
-                         font_size='11', fill='#7888a0',
+                         font_size='12', fill='#7888a0',
                          font_family='Inter, Segoe UI, sans-serif'))
 
     if highlight in DIPHTHONGS:
@@ -1229,7 +1231,7 @@ def create_vowel_chart_svg(highlight: Optional[str] = None) -> str:
             label_y = max(pcy, gcy) + 30
             dwg.add(dwg.text('sustain → vanish',
                              insert=(label_x, label_y),
-                             text_anchor='middle', font_size='9',
+                             text_anchor='middle', font_size='10',
                              fill='#98a8c0',
                              font_family='Inter, sans-serif',
                              letter_spacing='1', font_style='italic'))
@@ -1959,6 +1961,11 @@ class CoachingView(QWidget):
         self._edit_is_new: bool = False
         self._edit_ov: object = None   # _NoteEditOverlay or None
 
+        # undo stack (snapshot model — list of note-list snapshots)
+        self._undo_stack: list = []
+        self._UNDO_LIMIT = 50
+        self._pending_undo = None   # pre-state for the open edit session, or None
+
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setFocusPolicy(Qt.ClickFocus)
@@ -1968,6 +1975,11 @@ class CoachingView(QWidget):
 
     def set_song(self, song):
         self._close_edit(commit=True)
+        # Reset undo history when switching to a different song.
+        # Same-song refreshes (e.g. after import) must NOT clear the stack.
+        if song is not self._song:
+            self._undo_stack = []
+        self._pending_undo = None
         self._song   = song
         self._lyrics = song.lyrics if song else ''
         self._notes  = song.coaching_notes if song else []
@@ -1976,6 +1988,28 @@ class CoachingView(QWidget):
     def set_font_pt(self, pt: int):
         self._font_pt = pt
         self._relayout()
+
+    def snapshot_notes(self) -> list:
+        """Return a deep copy of the current notes list for undo."""
+        return [CoachingNote(n.anchor_start, n.anchor_end, n.text)
+                for n in self._notes]
+
+    def push_undo(self, snapshot: list):
+        """Push *snapshot* onto the undo stack, trimming at the limit."""
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > self._UNDO_LIMIT:
+            del self._undo_stack[0]
+
+    def undo(self) -> bool:
+        """Pop the top snapshot and restore notes in-place.  Returns True on success."""
+        if not self._undo_stack:
+            return False
+        self._close_edit(commit=False)   # abandon any open editor
+        snap = self._undo_stack.pop()
+        self._notes[:] = snap            # in-place → song.coaching_notes updates too
+        self._relayout()
+        self.notes_changed.emit()        # triggers autosave
+        return True
 
     def sizeHint(self):
         from PyQt5.QtCore import QSize
@@ -2478,28 +2512,24 @@ class CoachingView(QWidget):
             return
 
         # create new note
+        self._close_edit(commit=True)               # flush any prior session
+        self._pending_undo = self.snapshot_notes()  # pre-create state (no new note yet)
         new_note = CoachingNote(
             anchor_start=start_key, anchor_end=end_key, text='')
         self._notes.append(new_note)
         self._relayout()
-        self._start_edit(new_note, is_new=True)
+        self._start_edit(new_note, is_new=True)     # internal flush is a no-op; won't overwrite pending
 
     def contextMenuEvent(self, ev):
+        """Right-click a bubble → delete it immediately (undoable)."""
         bi_info = self._bubble_at(ev.pos())
         if not bi_info:
             return
         note = bi_info['note']
-        menu = QMenu(self)
-        edit_act   = menu.addAction('Edit note…')
-        delete_act = menu.addAction('Delete note')
-        chosen = menu.exec_(ev.globalPos())
-        if chosen == edit_act:
-            self._close_edit(commit=True)
-            self._start_edit(note, is_new=False)
-        elif chosen == delete_act:
-            self._close_edit(commit=True)
-            if note in self._notes:
-                self._notes.remove(note)
+        self._close_edit(commit=True)
+        if note in self._notes:
+            self.push_undo(self.snapshot_notes())   # pre-delete snapshot
+            self._notes.remove(note)
             self._relayout()
             self.notes_changed.emit()
 
@@ -2513,6 +2543,12 @@ class CoachingView(QWidget):
         self._edit_note   = note
         self._edit_is_new = is_new
 
+        # Capture pre-state for existing notes so the edit can be undone.
+        # For new notes the caller sets _pending_undo BEFORE appending, so
+        # we must not overwrite it here.
+        if not is_new:
+            self._pending_undo = self.snapshot_notes()
+
         # find bubble rect (relayout first if note is freshly appended)
         bi_info = next((b for b in self._bubble_infos if b['note'] is note), None)
         if bi_info is None:
@@ -2525,11 +2561,31 @@ class CoachingView(QWidget):
             self._edit_is_new = False
             return
 
-        rect = bi_info['rect']
-        ov   = _NoteEditOverlay(self)
-        ov.setFont(self._font())
+        rect   = bi_info['rect']
+        ov     = _NoteEditOverlay(self)
+        bfont  = self._bubble_font()
+        ov.setFont(bfont)
+        ov.setStyleSheet(
+            f"QPlainTextEdit {{"
+            f" background-color: {self._C_BUB_BG};"
+            f" color: {self._C_BUB_TEXT};"
+            f" border: {max(1, _scale(1))}px solid {self._C_BUB_BORDER};"
+            f" border-radius: {_scale(self._BRAD)}px;"
+            f" padding: {_scale(self._BPAD_V)}px {_scale(self._BPAD_H)}px;"
+            f" selection-background-color: {self._C_BUB_BORDER};"
+            f" selection-color: {self._C_BUB_TEXT}; }}"
+        )
+        # Ensure the overlay is wide and tall enough to type comfortably.
+        bfm    = QFontMetrics(bfont)
+        min_w  = _scale(180)
+        min_h  = bfm.height() * 3 + _scale(self._BPAD_V) * 2
+        ov_w   = max(rect.width(),  min_w)
+        ov_h   = max(rect.height(), min_h)
+        # Clamp inside widget bounds
+        ov_x   = max(0, min(rect.x(), self.width()  - ov_w))
+        ov_y   = max(0, min(rect.y(), self.height() - ov_h))
         ov.setPlainText(note.text)
-        ov.setGeometry(rect)
+        ov.setGeometry(ov_x, ov_y, ov_w, ov_h)
         ov.commit_edit.connect(self._on_edit_done)
         ov.show()
         ov.raise_()
@@ -2580,9 +2636,27 @@ class CoachingView(QWidget):
                 self._notes.remove(note)
                 # Don't emit notes_changed for an abandoned new note
 
+        # Commit or discard the pre-state captured before this edit session.
+        if self._pending_undo is not None:
+            if changed:
+                self.push_undo(self._pending_undo)
+            self._pending_undo = None
+
         self._relayout()
         if changed:
             self.notes_changed.emit()
+        # Restore focus so Ctrl+Z works immediately after committing.
+        self.setFocus()
+
+    def keyPressEvent(self, ev):
+        """Ctrl+Z undoes the last coaching-notes change (dedicated to this view;
+        the lyrics QTextEdit keeps its own Ctrl+Z)."""
+        if (ev.key() == Qt.Key_Z
+                and (ev.modifiers() & Qt.ControlModifier)
+                and not (ev.modifiers() & Qt.ShiftModifier)):
+            if self.undo():
+                return
+        super().keyPressEvent(ev)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
@@ -2812,6 +2886,7 @@ class VowelChartView(QWidget):
     def __init__(self):
         super().__init__()
         self._current = None
+        self._ui_scale = 1.0
         self.setMinimumSize(_scale(280), _scale(320))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -2828,6 +2903,11 @@ class VowelChartView(QWidget):
         layout.addWidget(self._view)
 
         self.show_vowel(None)
+
+    def setUiScale(self, scale: float):
+        self._ui_scale = scale
+        self.setMinimumSize(round(280 * scale), round(320 * scale))
+        self.show_vowel(self._current)   # re-render at new size
 
     def show_vowel(self, sym):
         self._current = sym
@@ -3261,7 +3341,6 @@ class AnalysisPanel(QWidget):
         self.word_label.setTextInteractionFlags(
             Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.speak_btn = QPushButton('▶ Speak')
-        self.speak_btn.setFixedHeight(_scale(28))
         self.speak_btn.setEnabled(False)
         self.speak_btn.clicked.connect(self._on_speak)
         wh_layout.addWidget(self.word_label, 1)
@@ -3304,8 +3383,8 @@ class AnalysisPanel(QWidget):
         vowel_btn_wrap.setLayout(self.vowel_btn_layout)
 
         self.chart = VowelChartView()
-        chart_container = AspectRatioContainer(self.chart, 390 / 425)
-        chart_container.setMinimumHeight(_scale(360))
+        self.chart_container = AspectRatioContainer(self.chart, 390 / 425)
+        self.chart_container.setMinimumHeight(_scale(360))
 
         self.card = ArticulationCard()
         self.card.step_clicked.connect(self._set_current_vowel)
@@ -3327,9 +3406,14 @@ class AnalysisPanel(QWidget):
         layout.addSpacing(_scale(4))
         layout.addWidget(vowel_header)
         layout.addWidget(vowel_btn_wrap)
-        layout.addWidget(chart_container, 1)
+        layout.addWidget(self.chart_container, 1)
         layout.addWidget(self.card)
         layout.addWidget(self.play_btn)
+
+    def setUiScale(self, scale: float):
+        """Propagate UI scale to the chart and its container."""
+        self.chart.setUiScale(scale)
+        self.chart_container.setMinimumHeight(round(360 * scale))
 
     def show_word(self, word, pronunciations, initial_index=0, next_ipa=None,
                   song_style='classical', enabled_hints=None, has_punct_boundary=False):
@@ -3811,15 +3895,16 @@ class MainWindow(QMainWindow):
         self._current_clicked_occ_key = None  # "word#N" for the last-clicked occurrence
         self._current_char_offset = -1  # in-block offset of the last-clicked word
         self._missing_audio_warned: set = set()  # warn once per missing symbol
-        # Sequential vowel playback (Play line vowels)
+        # Sequential vowel playback (Play line vowels) — hold-cap model:
+        # each vowel sounds for at most _seq_hold_ms ms, then advances.
         self._vowel_seq: list = []
         self._vowel_seq_idx = 0
         self._vowel_seq_active = False
-        self._seq_gap_ms: int = 150  # gap between vowels; restored from settings
-        self._seq_gap = QTimer(self)
-        self._seq_gap.setSingleShot(True)
-        self._seq_gap.setInterval(self._seq_gap_ms)
-        self._seq_gap.timeout.connect(self._advance_vowel_seq)
+        self._seq_hold_ms: int = 320   # default: Fast preset
+        self._seq_hold = QTimer(self)
+        self._seq_hold.setSingleShot(True)
+        self._seq_hold.setInterval(self._seq_hold_ms)
+        self._seq_hold.timeout.connect(self._on_seq_hold_elapsed)
         self.player.mediaStatusChanged.connect(self._on_media_status)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -3875,7 +3960,6 @@ class MainWindow(QMainWindow):
         lyrics_title.setObjectName('PanelTitle')
         self.hints_btn = QToolButton()
         self.hints_btn.setObjectName('HintsToggle')
-        self.hints_btn.setFixedHeight(_scale(22))
         self.hints_btn.setPopupMode(QToolButton.InstantPopup)
         self.hints_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self._hints_menu = self._build_hints_menu()
@@ -3885,7 +3969,6 @@ class MainWindow(QMainWindow):
         lh_layout.addStretch()
         self.missing_ipa_btn = QToolButton()
         self.missing_ipa_btn.setObjectName('HintsToggle')
-        self.missing_ipa_btn.setFixedHeight(_scale(22))
         self.missing_ipa_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.missing_ipa_btn.setToolTip(
             'Some words have no IPA pronunciation. Click to review and '
@@ -3895,7 +3978,6 @@ class MainWindow(QMainWindow):
         lh_layout.addWidget(self.missing_ipa_btn)
         self.style_btn = QToolButton()
         self.style_btn.setObjectName('HintsToggle')
-        self.style_btn.setFixedHeight(_scale(22))
         self.style_btn.setPopupMode(QToolButton.InstantPopup)
         self.style_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self._style_menu = self._build_style_menu()
@@ -3910,7 +3992,6 @@ class MainWindow(QMainWindow):
 
         self.lyrics_view_btn = QToolButton()
         self.lyrics_view_btn.setObjectName('HintsToggle')
-        self.lyrics_view_btn.setFixedHeight(_scale(22))
         self.lyrics_view_btn.setCheckable(True)
         self.lyrics_view_btn.setChecked(True)
         self.lyrics_view_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
@@ -3919,7 +4000,6 @@ class MainWindow(QMainWindow):
 
         self.coaching_btn = QToolButton()
         self.coaching_btn.setObjectName('HintsToggle')
-        self.coaching_btn.setFixedHeight(_scale(22))
         self.coaching_btn.setCheckable(True)
         self.coaching_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.coaching_btn.setText('Notes')
@@ -3929,7 +4009,6 @@ class MainWindow(QMainWindow):
 
         self.ipa_view_btn = QToolButton()
         self.ipa_view_btn.setObjectName('HintsToggle')
-        self.ipa_view_btn.setFixedHeight(_scale(22))
         self.ipa_view_btn.setCheckable(True)
         self.ipa_view_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.ipa_view_btn.setText('IPA')
@@ -3988,21 +4067,19 @@ class MainWindow(QMainWindow):
         th_layout.addWidget(traj_title)
         th_layout.addStretch()
         # Speed selector for Play line vowels
-        self._seq_speed_label = QLabel('Gap:')
+        self._seq_speed_label = QLabel('Speed:')
         self._seq_speed_label.setObjectName('Caption')
         self._seq_speed_combo = QComboBox()
-        self._seq_speed_combo.setFixedHeight(_scale(22))
         self._seq_speed_combo.setToolTip(
-            'Pause between vowels when playing the line in sequence.')
+            'Maximum sounding duration per vowel when playing the line in sequence.')
         for label, ms in self._SEQ_SPEED_PRESETS:
             self._seq_speed_combo.addItem(label, ms)
-        self._seq_speed_combo.setCurrentIndex(1)  # default: Normal (150 ms)
+        self._seq_speed_combo.setCurrentIndex(0)  # default: Fast (320 ms hold)
         self._seq_speed_combo.currentIndexChanged.connect(self._on_seq_speed_changed)
         th_layout.addWidget(self._seq_speed_label)
         th_layout.addWidget(self._seq_speed_combo)
         self.play_line_btn = QToolButton()
         self.play_line_btn.setObjectName('HintsToggle')
-        self.play_line_btn.setFixedHeight(_scale(22))
         self.play_line_btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.play_line_btn.setText('▶  Play line vowels')
         self.play_line_btn.setToolTip(
@@ -4093,14 +4170,17 @@ class MainWindow(QMainWindow):
         """Set lyrics editor font via a widget-level stylesheet so it
         overrides the global QSS font-size rule reliably.
         Font family comes from the global QSS; only size is set here.
+        An effective size is computed by scaling the base point size by
+        the current UI scale so Notes and IPA views track UI scale too.
         """
+        eff = max(8, round(self._editor_font_size * self._ui_scale))
         self.editor.setStyleSheet(
-            f"QTextEdit {{ font-size: {self._editor_font_size}pt; }}"
+            f"QTextEdit {{ font-size: {eff}pt; }}"
         )
         if hasattr(self, 'coaching_view'):
-            self.coaching_view.set_font_pt(self._editor_font_size)
+            self.coaching_view.set_font_pt(eff)
         if hasattr(self, 'ipa_view'):
-            self.ipa_view.set_font_pt(self._editor_font_size)
+            self.ipa_view.set_font_pt(eff)
 
     def _adjust_ui_scale(self):
         """Let the user scale the whole UI (layout + fonts) as a percentage.
@@ -4123,6 +4203,8 @@ class MainWindow(QMainWindow):
             self.setStyleSheet(build_style(_dpr(), self._ui_scale))
             self.trajectory.setUiScale(self._ui_scale)
             self.analysis.card.brightness_bar.setUiScale(self._ui_scale)
+            self.analysis.setUiScale(self._ui_scale)
+            self._apply_editor_font()
 
     def _adjust_font_size(self):
         new, ok = QInputDialog.getInt(
@@ -4233,6 +4315,7 @@ class MainWindow(QMainWindow):
             self.active_song.lyrics = self.editor.toPlainText()
             self.coaching_view.set_song(self.active_song)
             self.lyrics_stack.setCurrentIndex(1)
+            self.coaching_view.setFocus()   # Ctrl+Z works without an extra click
         elif idx == 2:
             # Interlinear IPA view — flush editor text, rebuild view data
             self.active_song.lyrics = self.editor.toPlainText()
@@ -4406,18 +4489,17 @@ class MainWindow(QMainWindow):
 
     # (label, gap_ms) — gap inserted between vowels after audio finishes
     _SEQ_SPEED_PRESETS = [
-        ('Fast',    0),
-        ('Normal', 150),
-        ('Slow',   400),
+        ('Fast',   320),
+        ('Faster', 170),
     ]
 
     def _on_seq_speed_changed(self, index: int):
         ms = self._seq_speed_combo.itemData(index)
         if ms is None:
             return
-        self._seq_gap_ms = int(ms)
-        self._seq_gap.setInterval(self._seq_gap_ms)
-        self.settings.setValue('seqGapMs', self._seq_gap_ms)
+        self._seq_hold_ms = int(ms)
+        self._seq_hold.setInterval(self._seq_hold_ms)
+        self.settings.setValue('seqHoldMs', self._seq_hold_ms)
 
     # ---- Inline annotation hints ----
 
@@ -4921,6 +5003,7 @@ class MainWindow(QMainWindow):
         if audio:
             self.player.setMedia(QMediaContent(QUrl.fromLocalFile(audio)))
             self.player.play()
+            self._seq_hold.start()   # cap this vowel's sounding duration
         else:
             # No audio for this vowel — skip straight to the next one.
             self._advance_vowel_seq()
@@ -4929,9 +5012,18 @@ class MainWindow(QMainWindow):
         self._vowel_seq_idx += 1
         self._play_seq_current()
 
+    def _on_seq_hold_elapsed(self):
+        """Hold-cap timer fired — stop the clip and move to the next vowel."""
+        if not self._vowel_seq_active:
+            return
+        self.player.stop()
+        self._advance_vowel_seq()
+
     def _on_media_status(self, status):
+        """Clip ended before the hold cap — cancel the cap and advance early."""
         if status == QMediaPlayer.EndOfMedia and self._vowel_seq_active:
-            self._seq_gap.start()  # brief pause, then advance
+            self._seq_hold.stop()
+            self._advance_vowel_seq()
 
     @staticmethod
     def _resource_path(relative):
@@ -5280,6 +5372,10 @@ class MainWindow(QMainWindow):
         lyrics = self.active_song.lyrics
         occ = word_occurrences(lyrics)  # list of (match, "word#N")
 
+        # Snapshot BEFORE appending so one Ctrl+Z reverts the whole import batch.
+        pre_import = [CoachingNote(n.anchor_start, n.anchor_end, n.text)
+                      for n in self.active_song.coaching_notes]
+
         matched = 0
         ambiguous = 0
         unmatched_anchors = []
@@ -5334,6 +5430,10 @@ class MainWindow(QMainWindow):
         # Refresh coaching view and persist
         if hasattr(self, 'coaching_view'):
             self.coaching_view.set_song(self.active_song)
+            # Push pre-import snapshot AFTER set_song so same-song refresh
+            # doesn't clear the stack, and one Ctrl+Z removes the whole batch.
+            if (matched + ambiguous) > 0:
+                self.coaching_view.push_undo(pre_import)
         self._schedule_save()
 
         # Build report
@@ -5391,6 +5491,8 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(build_style(_dpr(), self._ui_scale))
         self.trajectory.setUiScale(self._ui_scale)
         self.analysis.card.brightness_bar.setUiScale(self._ui_scale)
+        self.analysis.setUiScale(self._ui_scale)
+        self._apply_editor_font()
         # Persist enabled hint types
         saved_hints = self.settings.value('enabledHintTypes', None)
         if saved_hints is not None:
@@ -5412,21 +5514,22 @@ class MainWindow(QMainWindow):
         if saved_opacity is not None:
             self._hint_opacity = max(0.0, min(1.0, float(saved_opacity)))
         self.editor.set_highlight_opacity(self._hint_opacity)
-        # Persist Play-line-vowels gap speed
-        saved_gap = self.settings.value('seqGapMs', None)
-        if saved_gap is not None:
-            self._seq_gap_ms = int(saved_gap)
-            self._seq_gap.setInterval(self._seq_gap_ms)
-            # Sync combo to the nearest preset (exact match preferred)
-            best_idx = 1  # fallback to Normal
-            best_diff = abs(self._seq_gap_ms - self._SEQ_SPEED_PRESETS[1][1])
+        # Persist Play-line-vowels hold speed
+        saved_hold = self.settings.value('seqHoldMs', None)
+        if saved_hold is not None:
+            self._seq_hold_ms = int(saved_hold)
+            self._seq_hold.setInterval(self._seq_hold_ms)
+            # Sync combo to the nearest preset by hold_ms
+            best_idx = 0
+            best_diff = abs(self._seq_hold_ms - self._SEQ_SPEED_PRESETS[0][1])
             for i, (_, ms) in enumerate(self._SEQ_SPEED_PRESETS):
-                diff = abs(self._seq_gap_ms - ms)
+                diff = abs(self._seq_hold_ms - ms)
                 if diff < best_diff:
                     best_diff, best_idx = diff, i
             self._seq_speed_combo.blockSignals(True)
             self._seq_speed_combo.setCurrentIndex(best_idx)
             self._seq_speed_combo.blockSignals(False)
+        # (Any legacy speed setting from prior versions is silently ignored.)
 
 
     def _line_to_ipa_words(self, line_text: str,
