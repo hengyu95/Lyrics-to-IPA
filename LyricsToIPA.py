@@ -544,6 +544,7 @@ class CoachingNote:
     anchor_start: str   # "word#N"
     anchor_end: str     # "word#N" (== anchor_start for a single word)
     text: str
+    anchor_text: str = ''  # verbatim lyrics span; used to re-anchor if lyrics change
 
 
 # =============================================================================
@@ -575,6 +576,36 @@ def resolve_anchor(lyrics: str, start_key: str, end_key: str):
         return None
     lo, hi = sorted((a.start(), b.end()))   # tolerate reversed drag
     return (lo, hi)
+
+
+def match_anchor_keys(lyrics: str, anchor: str, occ=None):
+    """Return (start_key, end_key, is_ambiguous) for the first occurrence of
+    *anchor* in *lyrics*, or None if not found.  *occ* may be a precomputed
+    word_occurrences(lyrics)."""
+    if not anchor:
+        return None
+    idx = lyrics.find(anchor)
+    if idx == -1:
+        idx = lyrics.lower().find(anchor.lower())
+        if idx == -1:
+            return None
+    span_end = idx + len(anchor)
+    second = lyrics.find(anchor, idx + 1)
+    if second == -1:
+        second = lyrics.lower().find(anchor.lower(), idx + 1)
+    is_ambiguous = second != -1
+    if occ is None:
+        occ = word_occurrences(lyrics)
+    start_key = end_key = None
+    for wm, wkey in occ:
+        ws, we = wm.start(), wm.end()
+        if start_key is None and we > idx:
+            start_key = wkey
+        if ws < span_end:
+            end_key = wkey
+    if start_key is None or end_key is None:
+        return None
+    return (start_key, end_key, is_ambiguous)
 
 
 def _coaching_wrap_text(text: str, fm: QFontMetrics, max_w: int) -> list:
@@ -1321,7 +1352,8 @@ class Song:
                 'style': self.style,
                 'sustained_words': [w for w in self.sustained_words if w in pw],
                 'coaching_notes': [
-                    {'start': n.anchor_start, 'end': n.anchor_end, 'text': n.text}
+                    {'start': n.anchor_start, 'end': n.anchor_end,
+                     'text': n.text, 'anchor': n.anchor_text}
                     for n in self.coaching_notes
                 ]}
 
@@ -1338,7 +1370,8 @@ class Song:
                        CoachingNote(
                            d2.get('start', ''),
                            d2.get('end', ''),
-                           d2.get('text', ''))
+                           d2.get('text', ''),
+                           d2.get('anchor', ''))
                        for d2 in d.get('coaching_notes', [])
                    ])
 
@@ -1991,7 +2024,7 @@ class CoachingView(QWidget):
 
     def snapshot_notes(self) -> list:
         """Return a deep copy of the current notes list for undo."""
-        return [CoachingNote(n.anchor_start, n.anchor_end, n.text)
+        return [CoachingNote(n.anchor_start, n.anchor_end, n.text, n.anchor_text)
                 for n in self._notes]
 
     def push_undo(self, snapshot: list):
@@ -2010,6 +2043,15 @@ class CoachingView(QWidget):
         self._relayout()
         self.notes_changed.emit()        # triggers autosave
         return True
+
+    def clear_all_notes(self):
+        """Delete all notes for the current song (undoable via Ctrl+Z)."""
+        if not self._notes:
+            return
+        self.push_undo(self.snapshot_notes())
+        self._notes[:] = []          # in-place so song.coaching_notes updates too
+        self._relayout()
+        self.notes_changed.emit()
 
     def sizeHint(self):
         from PyQt5.QtCore import QSize
@@ -2514,8 +2556,12 @@ class CoachingView(QWidget):
         # create new note
         self._close_edit(commit=True)               # flush any prior session
         self._pending_undo = self.snapshot_notes()  # pre-create state (no new note yet)
+        # Compute anchor_text from the span so the note can be re-matched later
+        _span = resolve_anchor(self._lyrics, start_key, end_key)
+        _anchor_text = self._lyrics[_span[0]:_span[1]] if _span else ''
         new_note = CoachingNote(
-            anchor_start=start_key, anchor_end=end_key, text='')
+            anchor_start=start_key, anchor_end=end_key, text='',
+            anchor_text=_anchor_text)
         self._notes.append(new_note)
         self._relayout()
         self._start_edit(new_note, is_new=True)     # internal flush is a no-op; won't overwrite pending
@@ -2703,6 +2749,10 @@ class LyricsIpaView(QWidget):
         # Hit-test cache: list of (QRect, word_lower, bn, co) — word box only
         self._word_rects: list = []
         self._total_h: int = _scale(100)
+        # Diction hint overlay state
+        self._ann_map: dict = {}     # (bn, co) → list[WordAnnotation]
+        self._hints_enabled: bool = False
+        self._hint_opacity: float = 0.5
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -2712,6 +2762,21 @@ class LyricsIpaView(QWidget):
         """*blocks*: list of per-line lists of (word, ipa_str, block_number, char_offset)."""
         self._blocks = blocks
         self._relayout()
+
+    def set_annotations(self, annotations: list, enabled: bool):
+        """Update the diction-hint overlay.  *annotations* is the same list that
+        LyricsEditor.set_annotations receives; *enabled* gates the whole feature."""
+        self._hints_enabled = enabled
+        m: dict = {}
+        if enabled:
+            for a in annotations:
+                m.setdefault((a.block, a.start), []).append(a)
+        self._ann_map = m
+        self.update()
+
+    def set_highlight_opacity(self, opacity: float):
+        self._hint_opacity = max(0.0, min(1.0, opacity))
+        self.update()
 
     def set_font_pt(self, pt: int):
         self._font_pt = pt
@@ -2728,6 +2793,20 @@ class LyricsIpaView(QWidget):
 
     def _ipa_font(self) -> QFont:
         return QFont('Charis SIL', max(8, self._font_pt - 3))
+
+    def _ipa_cell_width(self, ifm: QFontMetrics, s: str) -> int:
+        """Cell width for an IPA string, sized to never clip hooked/tailed glyphs.
+
+        Qt's horizontalAdvance() misses rightward glyph overhang (ɚ, ɹ, ɾ …).
+        boundingRect().right() + 1 gives the rightmost ink pixel from draw
+        position 0, which is what actually matters for clip avoidance.
+        A generous fixed pad covers any remaining sub-pixel / rounding slop.
+        """
+        br = ifm.boundingRect(s)
+        # br.right() is the inclusive rightmost x of the ink rect relative to
+        # the draw origin; +1 converts to an exclusive (width-style) value.
+        right_edge = max(ifm.horizontalAdvance(s), br.right() + 1, br.width())
+        return right_edge + _scale(12)
 
     # ── layout ─────────────────────────────────────────────────────────────
 
@@ -2765,7 +2844,7 @@ class LyricsIpaView(QWidget):
             for item in line_list:
                 word, ipa_str, bn, co = item
                 ww = wfm.horizontalAdvance(word)
-                iw = ifm.horizontalAdvance(ipa_str)
+                iw = self._ipa_cell_width(ifm, ipa_str)
                 cell_w = max(ww, iw)
                 if cur_row and cur_x + word_gap + cell_w > content_w:
                     rows.append(cur_row)
@@ -2833,7 +2912,7 @@ class LyricsIpaView(QWidget):
             for item in line_list:
                 word, ipa_str, bn, co = item
                 ww = wfm.horizontalAdvance(word)
-                iw = ifm.horizontalAdvance(ipa_str)
+                iw = self._ipa_cell_width(ifm, ipa_str)
                 cell_w = max(ww, iw)
                 if cur_row and cur_x + word_gap + cell_w > content_w:
                     rows.append(cur_row)
@@ -2847,17 +2926,30 @@ class LyricsIpaView(QWidget):
             for row in rows:
                 x = margin
                 for (word, ipa_str, bn, co, ww, iw, cell_w) in row:
+                    # ── diction hint: bg tint + underline ────────────────
+                    if self._hints_enabled:
+                        anns = self._ann_map.get((bn, co))
+                        if anns:
+                            _C_BG_HEX = self._C_BG
+                            tinted = _blend_hex(_C_BG_HEX, anns[0].bg_color,
+                                                self._hint_opacity)
+                            p.fillRect(x, y, cell_w, wlh, tinted)
+                            # Solid underline (full color, ignores opacity)
+                            ul_y = y + wlh - _scale(1)
+                            p.setPen(QColor(anns[0].color))
+                            p.drawLine(x + (cell_w - ww) // 2, ul_y,
+                                       x + (cell_w - ww) // 2 + ww, ul_y)
                     # Word centered in its cell
                     word_x = x + (cell_w - ww) // 2
                     p.setFont(wfont)
                     p.setPen(QColor(self._C_TEXT))
                     p.drawText(word_x, y, ww + _scale(2), wlh,
                                Qt.AlignLeft | Qt.AlignVCenter, word)
-                    # IPA centered beneath it
+                    # IPA centered beneath it (iw already includes right padding)
                     ipa_x = x + (cell_w - iw) // 2
                     p.setFont(ifont)
                     p.setPen(QColor(self._C_MUTED))
-                    p.drawText(ipa_x, y + wlh + ipa_gap, iw + _scale(2), ilh,
+                    p.drawText(ipa_x, y + wlh + ipa_gap, iw, ilh,
                                Qt.AlignLeft | Qt.AlignVCenter, ipa_str)
                     x += cell_w + word_gap
                 y += pair_h + row_gap
@@ -2880,6 +2972,18 @@ class LyricsIpaView(QWidget):
             if rect.contains(pos):
                 self.word_clicked.emit(word_lower, bn, co)
                 return
+
+    def mouseMoveEvent(self, ev):
+        if self._hints_enabled and self._ann_map:
+            pos = ev.pos()
+            for (rect, word_lower, bn, co) in self._word_rects:
+                if rect.contains(pos):
+                    anns = self._ann_map.get((bn, co))
+                    if anns:
+                        tip = '\n\n'.join(dict.fromkeys(a.tip_text for a in anns))
+                        QToolTip.showText(ev.globalPos(), tip, self)
+                        return
+        QToolTip.hideText()
 
 
 class VowelChartView(QWidget):
@@ -3914,6 +4018,7 @@ class MainWindow(QMainWindow):
         self._editor_font_size = 16
         self._ui_scale: float = 1.0  # adjusted via View → Adjust UI Scale
         self._hint_opacity: float = 0.5  # hint-highlight blend opacity [0.0, 1.0]
+        self._ipa_hints_enabled: bool = False  # Show diction hints in IPA view
         self._annotations_enabled = True
         self._enabled_hint_types = {'legato','vowel_glide','crash','r_toxicity','dark_l','glottal','plosive','nasal','approx','fricative','yod','ng_release','diphthong','aspiration'}
         self._word_annotations = []
@@ -4165,6 +4270,17 @@ class MainWindow(QMainWindow):
         a = QAction('Adjust Hint Highlight &Opacity…', self)
         a.triggered.connect(self._adjust_hint_opacity)
         s.addAction(a)
+        s.addSeparator()
+        a = QAction('Show Diction Hints in IPA View', self)
+        a.setCheckable(True)
+        a.setChecked(self._ipa_hints_enabled)
+        a.triggered.connect(self._on_toggle_ipa_hints)
+        s.addAction(a)
+        self._ipa_hints_action = a
+        s.addSeparator()
+        a = QAction('Clear All Coaching Notes for This Song…', self)
+        a.triggered.connect(self._on_clear_all_coaching_notes)
+        s.addAction(a)
 
     def _apply_editor_font(self):
         """Set lyrics editor font via a widget-level stylesheet so it
@@ -4241,6 +4357,7 @@ class MainWindow(QMainWindow):
         def _on_slider(v):
             pct_label.setText(f'{v}%')
             self.editor.set_highlight_opacity(v / 100.0)
+            self.ipa_view.set_highlight_opacity(v / 100.0)
 
         slider.valueChanged.connect(_on_slider)
 
@@ -4261,7 +4378,28 @@ class MainWindow(QMainWindow):
         else:
             # Restore original value on cancel
             self.editor.set_highlight_opacity(original)
+            self.ipa_view.set_highlight_opacity(original)
             self._hint_opacity = original
+
+    def _on_clear_all_coaching_notes(self):
+        """Prompt, then delete all coaching notes for the active song (undoable)."""
+        if not self.active_song or not self.active_song.coaching_notes:
+            QMessageBox.information(self, 'No Notes',
+                                    'There are no coaching notes for this song.')
+            return
+        n = len(self.active_song.coaching_notes)
+        name = self.active_song.name
+        ans = QMessageBox.question(
+            self, 'Clear All Coaching Notes',
+            f'Delete all {n} coaching note{"s" if n != 1 else ""} for '
+            f'"{name}"?\n\nThis can be undone with Ctrl+Z in the Notes view.',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ans == QMessageBox.Yes:
+            self.coaching_view.clear_all_notes()
+
+    def _on_toggle_ipa_hints(self, checked: bool):
+        self._ipa_hints_enabled = checked
+        self.ipa_view.set_annotations(self._word_annotations, checked)
 
     # ---- Song handling ----
 
@@ -4289,12 +4427,40 @@ class MainWindow(QMainWindow):
         self._vowel_seq_active = False
         self._update_missing_ipa_indicator()
         if hasattr(self, 'coaching_view'):
+            self._reanchor_notes_to_lyrics(song)
             self.coaching_view.set_song(song)
         # Always return to the lyrics editor when switching songs
         if hasattr(self, 'lyrics_stack'):
             self.lyrics_stack.setCurrentIndex(0)
         if hasattr(self, '_view_btn_group'):
             self.lyrics_view_btn.setChecked(True)
+
+    def _reanchor_notes_to_lyrics(self, song):
+        """Re-point any coaching note whose anchor_text no longer matches its
+        stored word-key span.  Only orphaned / mis-pointing notes are moved;
+        correctly placed notes are never disturbed (skip-on-span-match rule)."""
+        if not song or not song.coaching_notes:
+            return
+        lyrics = song.lyrics
+        occ = word_occurrences(lyrics)
+        def _norm(s):
+            return ' '.join(s.split()).lower()
+        changed = False
+        for n in song.coaching_notes:
+            if not n.anchor_text:
+                continue
+            span = resolve_anchor(lyrics, n.anchor_start, n.anchor_end)
+            # Correctly placed already — never disturb it
+            if span is not None and _norm(lyrics[span[0]:span[1]]) == _norm(n.anchor_text):
+                continue
+            res = match_anchor_keys(lyrics, n.anchor_text, occ)
+            if res:
+                sk, ek, _amb = res
+                if (sk, ek) != (n.anchor_start, n.anchor_end):
+                    n.anchor_start, n.anchor_end = sk, ek
+                    changed = True
+        if changed:
+            self._schedule_save()
 
     def _on_song_changed(self, idx):
         if idx < 0 or idx >= len(self.songs) or idx == self.active_index:
@@ -4313,6 +4479,7 @@ class MainWindow(QMainWindow):
         elif idx == 1:
             # Notes / coaching view — flush editor text first
             self.active_song.lyrics = self.editor.toPlainText()
+            self._reanchor_notes_to_lyrics(self.active_song)
             self.coaching_view.set_song(self.active_song)
             self.lyrics_stack.setCurrentIndex(1)
             self.coaching_view.setFocus()   # Ctrl+Z works without an extra click
@@ -4321,6 +4488,7 @@ class MainWindow(QMainWindow):
             self.active_song.lyrics = self.editor.toPlainText()
             blocks = self._build_ipa_view_data()
             self.ipa_view.set_view_data(blocks)
+            self.ipa_view.set_annotations(self._word_annotations, self._ipa_hints_enabled)
             self.lyrics_stack.setCurrentIndex(2)
 
     def _on_coaching_toggle(self, checked: bool):
@@ -4378,6 +4546,7 @@ class MainWindow(QMainWindow):
                 self.lyrics_stack.currentIndex() == 2):
             blocks = self._build_ipa_view_data()
             self.ipa_view.set_view_data(blocks)
+            self.ipa_view.set_annotations(self._word_annotations, self._ipa_hints_enabled)
 
     def _schedule_save(self):
         self._save_timer.start()
@@ -4436,6 +4605,7 @@ class MainWindow(QMainWindow):
         if (hasattr(self, 'lyrics_stack') and
                 self.lyrics_stack.currentIndex() == 2):
             self.ipa_view.set_view_data(self._build_ipa_view_data())
+            self.ipa_view.set_annotations(self._word_annotations, self._ipa_hints_enabled)
 
     def _context_aware_pronunciations(self, word, next_ipa=None):
         """Apply next-word context rules to select a pronunciation.
@@ -4647,6 +4817,8 @@ class MainWindow(QMainWindow):
         """Scan all lyrics and compute inline diction annotations."""
         if not self._annotations_enabled:
             self.editor.clear_annotations()
+            if hasattr(self, 'ipa_view'):
+                self.ipa_view.set_annotations([], self._ipa_hints_enabled)
             return
         doc = self.editor.document()
         dismissed = self.active_song.dismissed_tips
@@ -4737,6 +4909,8 @@ class MainWindow(QMainWindow):
 
         self._word_annotations = annotations
         self.editor.set_annotations(annotations)
+        if hasattr(self, 'ipa_view'):
+            self.ipa_view.set_annotations(annotations, self._ipa_hints_enabled)
         self._update_missing_ipa_indicator()
 
     def _on_word_sustain_toggled(self, word_lower: str):
@@ -5386,41 +5560,15 @@ class MainWindow(QMainWindow):
             if not anchor or not note_text:
                 continue
 
-            # Case-sensitive search first, then case-insensitive fallback
-            idx = lyrics.find(anchor)
-            if idx == -1:
-                idx = lyrics.lower().find(anchor.lower())
-                if idx == -1:
-                    unmatched_anchors.append(anchor)
-                    continue
-
-            span_end = idx + len(anchor)
-
-            # Check for a second occurrence (ambiguity)
-            second = lyrics.find(anchor, idx + 1)
-            if second == -1:
-                second = lyrics.lower().find(anchor.lower(), idx + 1)
-            is_ambiguous = second != -1
-
-            # Map char span → word#N keys via word_occurrences
-            # Find the first word whose start >= idx and last word whose end <= span_end
-            start_key = None
-            end_key = None
-            for wm, wkey in occ:
-                ws, we = wm.start(), wm.end()
-                # start_key: first word that overlaps or starts within anchor
-                if start_key is None and we > idx:
-                    start_key = wkey
-                # end_key: last word whose start is before span_end
-                if ws < span_end:
-                    end_key = wkey
-
-            if start_key is None or end_key is None:
+            res = match_anchor_keys(lyrics, anchor, occ)
+            if res is None:
                 unmatched_anchors.append(anchor)
                 continue
 
+            start_key, end_key, is_ambiguous = res
+
             self.active_song.coaching_notes.append(
-                CoachingNote(start_key, end_key, note_text))
+                CoachingNote(start_key, end_key, note_text, anchor_text=anchor))
 
             if is_ambiguous:
                 ambiguous += 1
@@ -5514,6 +5662,14 @@ class MainWindow(QMainWindow):
         if saved_opacity is not None:
             self._hint_opacity = max(0.0, min(1.0, float(saved_opacity)))
         self.editor.set_highlight_opacity(self._hint_opacity)
+        if hasattr(self, 'ipa_view'):
+            self.ipa_view.set_highlight_opacity(self._hint_opacity)
+        # Restore IPA hints toggle
+        saved_ipa_hints = self.settings.value('ipaHintsEnabled', None)
+        if saved_ipa_hints is not None:
+            self._ipa_hints_enabled = saved_ipa_hints in (True, 'true', 'True', 1, '1')
+        if hasattr(self, '_ipa_hints_action'):
+            self._ipa_hints_action.setChecked(self._ipa_hints_enabled)
         # Persist Play-line-vowels hold speed
         saved_hold = self.settings.value('seqHoldMs', None)
         if saved_hold is not None:
@@ -5911,6 +6067,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue('editorFontSize', self._editor_font_size)
         self.settings.setValue('uiScale', self._ui_scale)
         self.settings.setValue('hintOpacity', self._hint_opacity)
+        self.settings.setValue('ipaHintsEnabled', self._ipa_hints_enabled)
         self.settings.setValue('enabledHintTypes', list(self._enabled_hint_types))
         super().closeEvent(event)
 
