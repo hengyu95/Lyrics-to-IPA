@@ -1,6 +1,6 @@
 # Lyric IPA Finder
 
-A vowel and diction tool for singers. Paste lyrics, click a word, get its IPA breakdown, vowel chart position, and articulation notes. Inline hints mark up the full lyrics so you can see diction issues across the whole phrase at once.
+A vowel and diction tool for singers. Paste lyrics, click a word, get its IPA breakdown, vowel chart position, and articulation notes. Inline hints mark up the full lyrics so diction issues are visible across the whole phrase at once. Mark high notes, climaxes, and breath placements to unlock phrase-budget feedback, a tension watchlist, and a direction prompt grounded in your actual choices.
 
 **Personal project built with LLM assistance. The singing tips are algorithmically generated and not verified. Cross-check anything important with your teacher.**
 
@@ -15,107 +15,220 @@ Download the latest `.exe` from the [releases page](../../releases). No installa
 ## Quick start
 
 1. Pick or create a song slot from the dropdown at the top of the lyrics panel
-2. Paste your lyrics in the **Lyrics** view
-3. Click any word in any view to open its analysis on the right
-4. Coloured highlights appear on words with diction notes; hover over a word to read its tip, or click the word to see it in the right panel — panel tips are selectable and copyable
+2. Paste your lyrics
+3. Click any word to open its analysis on the right
+4. Coloured highlights appear on words with diction notes; hover to read them
+5. Right-click any word to set custom IPA, toggle sustained, or mark it as a high note or breath point
 
 ---
 
 ## Lyrics panel
 
-### Views
+**Click a word** to open its full analysis on the right.
 
-Three mutually exclusive view buttons in the lyrics header switch the main canvas:
+**Right-click a word** for a context menu with:
 
-- **Lyrics** — the editable canvas; paste and edit text here.
-- **Notes** — read-only coaching mode: drag across a word or span to attach a short performance note; it appears as a sticky-note bubble beneath the line. Click a bubble to edit, right-click to delete.
-- **IPA** — read-only view showing the lyrics with each word's IPA printed directly beneath it, line by line.
+- *Set custom IPA* — override the dictionary pronunciation. Useful for proper nouns, foreign words, numbers. Enter without slashes, e.g. `valʒɑ̃`
+- *Dismiss hint* — hides the inline annotation for that word for this song
+- *Toggle sustained note* — marks a word for long-note pedagogy in the analysis panel
+- *High note on "word"* submenu — `None` / `High ▲` / `Climax ▲▲`. A small triangle glyph appears above the word in all three views. The Analysis panel shows a banner with vowel-planning and breath-banking advice. Climax marks additionally affect the modification-ladder caption.
+- *Breath after "word"* submenu — `None` / `Full breath ✓` / `Catch-breath '`. Glyphs appear inline in the lyrics editor, IPA view, and Notes view. Phrase-budget feedback activates once at least one breath mark is set.
 
-Clicking a word in **any** view opens that word's full analysis in the right panel and updates the phrase trajectory.
+**High and breath glyphs** track scrolling in all three views and appear in the cheat-sheet export.
 
-**Right-click a word** for:
+---
 
-- *Set custom IPA* — override the dictionary pronunciation. Useful for proper nouns, foreign words, and numbers. Enter without slashes, e.g. `valʒɑ̃` not `/valʒɑ̃/`. Words with accents or diacritics (résumé, über, caffè) are recognised as whole words and can be clicked and right-clicked the same way. The built-in dictionary won't transcribe most foreign words — set a custom IPA for those.
-- *Toggle sustained note* — marks a word for long-note tips in the analysis panel (vibrato handling, vowel-specific warnings)
-- *Dismiss hint* — hides the inline annotation for that word permanently for this song
+## Style button
 
-**Missing-IPA indicator** — a button that appears in the lyrics header when some words have no IPA pronunciation. Click it to review the list and start the IPA-prompt flow.
+The **LEGIT** / **CONTEMPORARY** button (top-right of the lyrics panel, next to the song name) sets the singing discipline for the active song. Stored as `classical` / `mt_ccm` in `songs.json`.
 
-**CLASSICAL / MT/CCM button** sets the singing style for the active song. Affects how aggressive certain tips are: R toxicity is a hard warning in classical mode, a soft note in MT/CCM; vowel-to-vowel glide insertion is presented as standard practice in MT/CCM and as one option among two in classical.
+| Feature | Legit / Classical | Contemporary / Pop-MT |
+|---|---|---|
+| R toxicity tip | Always fires on rhotic words | Skipped on ordinary notes; fires on sustained/high/climax with a sustain-release reminder |
+| Spurious diphthong check | Active | Skipped (speech-timed diphthongs are idiomatic) |
+| Vowel-to-vowel glide tip | Soft glide liaison recommended | Both options presented (connect *or* deliberate separation) |
+| Phrase-initial glottal tip | Balanced onset recommended | Glottal/cry onsets framed as expressive tools |
+| Modification ladder caption | Legit relaxation toward target | MT/belt framing: keep speech vowel, narrow not round |
+| Diphthong section caption | Sustain on primary, vanish late | Same + note that earlier glide is idiomatic in contemporary |
+| Dark L | Flagged | Not flagged |
 
-**HINTS button** opens a menu with a master on/off toggle, bulk enable/disable, and per-type checkboxes for the ten annotation categories.
-
-**Song menu:**
-
-- *Bulk Import IPAs* — paste a JSON object of word→IPA to set many custom pronunciations at once.
-- *Generate IPA Prompt to Clipboard* — scans the lyrics for unrecognised words and builds a prompt to paste into an AI; import the returned JSON via Bulk Import.
-- *Check for Missing IPAs* — lists words with no IPA and offers to generate that prompt for them.
-- *Generate Direction Prompt to Clipboard* — builds a research-and-performance-direction prompt for an AI. You can optionally name the character or voice part you're singing; the prompt includes the pronunciations you've already fixed and your sustained-word marks, and asks the AI to end its reply with a NOTES-FOR-IMPORT block.
-- *Import Coaching Notes* — paste the AI's reply from the Direction Prompt; the importer finds the NOTES-FOR-IMPORT block and adds those notes to the Notes view.
-- *Export Cheat Sheet (Markdown / PDF)* — exports the lyrics with IPA beneath each line plus a word-reference table (IPA, sustained marks, and diction tips).
-- *Reset Dismissed Hints* — restores all dismissed annotations for the active song.
-- *Open Save Folder* — opens the folder containing `songs.json`.
-
-**View menu** has font size, UI scale, and hint-highlight opacity controls. The opacity slider tones down the inline highlight background colours when many hint types are active; the underline still flags the word even at low opacity. All three settings persist across restarts.
+Style changes take effect immediately, recompute all hints, and re-run the Analysis panel for the current word.
 
 ---
 
 ## Inline hint types
 
-Background tints on words in the lyrics. Hover to read the tip; right-click to dismiss. The highlight intensity is adjustable via the View-menu opacity slider — the underline still flags the word even at low opacity.
+Background tints on words. Hover to read the tip; right-click to dismiss.
 
-| Colour | Type | What it flags |
+| Colour family | Type | What it flags |
 |---|---|---|
-| Dark amber | Legato link | Consonant-final word before a vowel-initial word. Carry the consonant across. |
-| Olive | Vowel glide | Vowel-final word before a vowel-initial word. Insert /j/ or /w/ to avoid a glottal stop. |
-| Wine red | Consonant crash | Stop-into-stop or stop-into-nasal at a word boundary. |
-| Deep crimson | R toxicity | Trailing /r/ or r-coloured vowel (/ɚ/, /ɝ/). De-rhotacize for classical/legit. |
-| Dark maroon | Dark L | Trailing /l/. Keep the tongue tip forward; don't pull the root back. |
-| Deep wine | Phrase-initial glottal | Phrase or line opens on a vowel. Use a balanced onset unless a glottal attack is intentional. |
-| Teal | Plosive exit | Trailing stop. Snap off cleanly; no shadow vowel. |
-| Teal green | Nasal / voiced fricative exit | Pitch-carrying consonant. Can be sustained for expressive weight. |
-| Forest teal | Approximant exit | /l/, /w/, /j/, /r/ exit. Advice differs per consonant. |
-| Steel teal | Fricative exit | Voiced fricatives flagged as sustain resources; unvoiced as air-dump risks. |
+| **Amber — transitions** | Legato link | Consonant-final before vowel-initial. Carry the consonant across. |
+| | Vowel glide | Vowel-final before vowel-initial. Insert /j/ or /w/ (or deliberate separation in contemporary). |
+| **Wine-red — caution** | R toxicity | Trailing /r/ or r-coloured vowel. De-rhotacize for legit; sustain-release reminder for contemporary on emphatic notes. |
+| | Consonant crash | Difficult stop/nasal cluster at a boundary. |
+| | Dark L | Trailing /l/ (legit only). Keep tongue tip forward. |
+| | Phrase-initial glottal | Line or post-punctuation vowel onset. Framing depends on style. |
+| | Aspiration | Pronounced /h/ in a phrase-medial position. |
+| **Teal — consonant exits** | Plosive exit | Trailing stop. Snap off cleanly. |
+| | Nasal exit | Nasal final. Sustain vowel; place the nasal late. |
+| | Approximant exit | /l/, /w/, /j/, /r/ final. Advice per consonant. |
+| | Fricative exit | Voiced = sustain resource; unvoiced = air-dump risk. |
+| **Other** | Yod coalescence | /t/, /d/, /n/, /s/, /z/ before /j/. |
+| | /ŋ/ release | Trailing /ŋ/. Nasal ring carries pitch; don't let it burst. |
+| | Spurious diphthong | Unexpected diphthong shape (legit mode only). |
 
-Hints are grouped into three hue families: **amber** (transitions — legato, vowel glide), **wine-red** (things to avoid — r toxicity, crashes, glottal, dark L), and **teal** (consonant exits). Underline colours remain individually distinctive and match the old palette if you find them easier to read.
+Multiple tips on the same word are stacked: hover shows all, background tint follows the primary (first) tip. The IPA view mirrors this when **Show Diction Hints in IPA View** is on (View menu).
 
-Punctuation (`,;:.!?`) suppresses legato tips at phrase boundaries. "the" automatically resolves to /ði/ before a vowel and /ðə/ before a consonant.
+Punctuation (`,;:.!?`) suppresses legato tips at phrase boundaries. "the" auto-resolves /ði/ / /ðə/ by context.
 
 ---
 
 ## Phrase trajectory
 
-A colour bar below the lyrics showing every vowel in the current line, warm for bright vowels and cool for dark ones. Gaps separate words. Click a syllable vowel button in the analysis panel to highlight its position in the bar.
+Colour bar below the lyrics — warm for bright vowels, cool for dark. Gaps separate words. Click a syllable-vowel button in the analysis panel to highlight its position.
 
-**Play line vowels** — plays every vowel in the current line in order through the TTS engine. The **Gap** selector beside it sets the pause between vowels during playback.
+Warnings below the bar:
 
-Two warnings appear below when triggered:
-
-- **Chiaroscuro** - line average brightness is very skewed; suggests how to counter-balance
-- **Breath support** - more than 55% of the line's consonants are unvoiced, which drains air support quickly
-
-Both thresholds are rough heuristics. Treat them as prompts, not rules.
+- **Chiaroscuro** — line brightness very skewed; counterbalance suggestion
+- **Breath support** — > 55% unvoiced consonants; high air-drain risk
+- **Phrase budget** — once breath marks exist, shows syllable count for the phrase containing the current word, with long-phrase and ends-on-marked-note warnings
 
 ---
 
 ## Analysis panel
 
-**Speak button** — reads the word using the currently selected pronunciation. Uses SAPI SSML with IPA input on Windows, so custom pronunciations like `valʒɑ̃` are passed directly to the synthesiser rather than guessed from spelling.
+**Speak** — reads the word via SAPI/SSML using the selected IPA.
 
-**Play vowel sound** — plays the currently selected vowel through the same TTS engine.
+**PRONUNCIATIONS** — multiple forms with brightness tags. Preference saved per occurrence.
 
-**PRONUNCIATIONS** — multiple pronunciations shown with brightness tags. Click to select. Preference is saved per song.
+**SYLLABLE VOWELS** — one button per vowel. Clicking highlights it on the chart and in the trajectory bar.
 
-**SYLLABLE VOWELS** — one button per vowel in the selected pronunciation. Clicking highlights that vowel on the chart and in the trajectory bar.
+**Vowel chart** — IPA trapezoid. High-pitch modification targets shown with a dashed arrow. Diphthongs show the arc.
 
-**Vowel chart** — IPA trapezoid with the selected vowel highlighted. High-pitch modification targets shown with a dashed arrow. Diphthongs show the sustain-to-glide arc.
+**Articulation card** — tongue, lips, brightness bar, singing notes. Contains:
 
-**Articulation card** — tongue position, lip shape, brightness bar, singing notes. Shows a stress warning when the selected vowel is on an unstressed syllable. If the word is marked as sustained (right-click in the lyrics), a sustained-note section appears with vowel-specific tips and vibrato notes.
+- *Stress warning* — if the selected vowel is unstressed
+- *High-note / climax banner* (▲ or ▲▲) — appears when the word is marked; gives vowel-planning and breath-banking advice, with a climax-specific intensity note
+- *Sustained-note tips* — when the word is marked sustained; vowel-specific vibrato and tension notes
+- *Modification ladder* — the high-pitch target vowel. Caption wording follows the song style (legit vs. contemporary/belt framing)
+- *Diphthong section* — glide timing; contemporary note appended in Contemporary mode
 
-**Panel tips** — same text as the hover tooltip for the current word, so you can read it without going back to the lyrics.
+**Panel tips** — boundary and supplementary tips for the current word, same text as the hover tooltip.
+
+---
+
+## Three views
+
+Switch with the **Lyrics / Notes / IPA** buttons above the lyrics area.
+
+**Lyrics** — the main editing and hint view.
+
+**Notes** — the coaching notes canvas. Click-drag to anchor a note across a word span. Each note shows a folded sticky-bubble. Ctrl+Z undoes. Undo is scoped to the Notes view and resets on song switch.
+
+**IPA** — interlinear layout: each word above its IPA transcription. Hover for the same diction tooltips as the Lyrics view (when IPA hints are on). Click a word to open it in the Analysis panel. High/breath mark glyphs appear above/after words.
+
+---
+
+## Song menu
+
+| Action | Description |
+|---|---|
+| Bulk Import IPAs | Paste `{"word": "ipa"}` JSON to set multiple custom pronunciations |
+| Generate IPA Prompt | Builds a prompt for unknown words; import the returned JSON via Bulk Import |
+| Check for Missing IPAs | Lists words with no pronunciation |
+| Generate Direction Prompt | Builds a nine-section research/coaching prompt grounded in your marks; see below |
+| Import Coaching Notes | Paste the NOTES-FOR-IMPORT block from a Direction Prompt response |
+| Tension Watchlist | Shows risk alerts for all emphatic (sustained/high/climax) words |
+| Export Cheat Sheet (Markdown) | Interlinear lyrics + word reference table + tension section as `.md` |
+| Export Cheat Sheet (PDF) | Same as Markdown, as a PDF |
+| Reset Dismissed Hints | Restores all dismissed annotations for this song |
+| Change Save Folder | Move where `songs.json` is stored; optionally copies existing data |
+| Open Save Folder | Opens the save folder in Explorer |
+
+---
+
+## Direction Prompt
+
+**Song → Generate Direction Prompt** copies a prompt to the clipboard that you paste into an AI assistant (Claude, ChatGPT, etc.). The AI returns nine prose sections followed by a `NOTES-FOR-IMPORT` block.
+
+Sections in the prompt:
+
+1. Identification
+2. Dramatic Context
+3. Emotional Arc
+4. Phrasing and Expression
+5. Acting Direction
+6. Singing Direction
+7. Tradition and Interpretation
+8. Pitfalls
+9. Breath, Support, and Body *(phrase-by-phrase breath strategy, support pacing, body reminders at specific words)*
+
+**Grounding data included in the prompt** (when present):
+
+- Custom IPA overrides you have set
+- Words you have marked sustained
+- High/climax marks with human-readable labels
+- Your breath plan as lyrics with ✓/' spliced in
+
+The import block draws coaching notes from sections 4, 5, and 9. Import via **Song → Import Coaching Notes**.
+
+---
+
+## Tension Watchlist
+
+**Song → Tension Watchlist** scans all emphatic words (sustained, high, or climax marks) and reports heuristic tension risks:
+
+- Close vowel (/i/, /y/, /u/) on a high or climax note → squeeze risk
+- /æ/ under load → jaw tension
+- Trailing /l/ on a held word → tongue-root pull-back
+- Trailing rhotic or r-coloured vowel on a held note → curl/bunch tension
+- Consonant cluster leading into a high or climax note → throat-setting risk
+
+The watchlist also appears as a section in both PDF and Markdown cheat-sheet exports (only when non-empty).
+
+---
+
+## Cheat sheet export
+
+**Song → Export Cheat Sheet** produces a `.md` or `.pdf` file with:
+
+- **Lyrics section** — interlinear text/IPA with ▲/▲▲/✓/' glyphs spliced into the text line
+- **Word Reference table** — one row per unique word; IPA shows all distinct pronunciations used across occurrences (e.g. `/ðə/ · /ði/`); Marks column shows ⭐ (sustained), ▲ (high), ▲▲ (climax)
+- **Tension Watchlist section** — only when emphatic marks exist
+- Footer legend: ⭐ = sustained · ▲ = high note · ▲▲ = climax · ✓/' = breath marks
+
+---
+
+## View menu
+
+| Item | Description |
+|---|---|
+| Adjust Lyrics Font Size | Changes editor font; persists |
+| Adjust UI Scale | Scales all UI elements; persists |
+| Adjust Hint Highlight Opacity | How strongly background tints show |
+| Show Diction Hints in IPA View | Mirrors the editor's tints and tooltips in the IPA view |
+| Clear All Coaching Notes for This Song | Removes all notes for the active song (undoable with Ctrl+Z in the Notes view) |
 
 ---
 
 ## Save data
 
-Each song slot remembers lyrics, custom IPA overrides, preferred pronunciations, dismissed hints, sustained word marks, coaching notes, and the style setting. Everything is stored in a single `songs.json` file. A rolling backup, `songs.bak.json`, is written alongside it before each save as a safety net against accidental edits. Use **Song > Open Save Folder** to locate them.
+Each song slot stores: lyrics, custom IPA overrides, preferred pronunciations (per occurrence), dismissed hints, sustained-word marks, high-note and breath marks, coaching notes, and the style setting.
+
+Everything lives in `songs.json` in a **pinned save folder**. The folder is fixed the first time the app runs (from the platform default), and written into settings so renaming the app never silently moves your data. Use **Song → Change Save Folder** to relocate it; the app offers to copy existing data.
+
+A rolling backup `songs.bak.json` is maintained automatically.
+
+---
+
+## Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| Ctrl+Z | Undo last note edit (Notes view only) |
+| Click a word | Open in analysis panel |
+| Right-click a word | Context menu (IPA, marks, hints) |
+
+---
+
+*All algorithmic coaching tips are heuristics. Verify important advice with a qualified teacher.*

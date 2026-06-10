@@ -82,10 +82,6 @@ def _scale(value: float) -> int:
     return max(1, round(value))
 
 
-def _scalef(value: float) -> float:
-    """Floating-point version of _scale."""
-    return float(value)
-
 
 # =============================================================================
 # Vowel database
@@ -395,15 +391,6 @@ def brightness(symbol: str) -> float:
     return max(0.0, min(1.0, b))
 
 
-def brightness_label(symbol: str) -> str:
-    b = brightness(symbol)
-    if b >= 0.7:
-        return 'bright'
-    if b >= 0.4:
-        return 'neutral'
-    return 'dark'
-
-
 def brightness_color(b: float) -> QColor:
     """Warm peach (bright) → cool blue (dark)."""
     if b >= 0.5:
@@ -552,7 +539,7 @@ class CoachingNote:
 # =============================================================================
 
 WORD_RE = re.compile(
-    r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['\u2018\u2019][A-Za-zÀ-ÖØ-öø-ÿ]+)*|[0-9]+"
+    r"[A-Za-zÀ-ÖØ-öø-ÿ\u0100-\u017F]+(?:['\u2018\u2019][A-Za-zÀ-ÖØ-öø-ÿ\u0100-\u017F]+)*|[0-9]+"
 )
 
 
@@ -581,19 +568,58 @@ def resolve_anchor(lyrics: str, start_key: str, end_key: str):
 def match_anchor_keys(lyrics: str, anchor: str, occ=None):
     """Return (start_key, end_key, is_ambiguous) for the first occurrence of
     *anchor* in *lyrics*, or None if not found.  *occ* may be a precomputed
-    word_occurrences(lyrics)."""
+    word_occurrences(lyrics).
+
+    Search tiers (stops at the first tier that matches):
+      1. Word-boundary regex, case-sensitive.
+      2. Word-boundary regex, case-insensitive.
+      3. Raw substring find (fallback — keeps punctuation-spanning anchors working).
+    Ambiguity is always tested within the same tier as the primary match.
+    """
     if not anchor:
         return None
-    idx = lyrics.find(anchor)
+
+    # Build a word-boundary pattern that respects apostrophe-joined contractions.
+    # (?<![\w''']) prevents matching inside a word; (?![\w''']) same at end.
+    _apos = "'''"
+    try:
+        _pat_cs  = re.compile(r"(?<![\w" + _apos + r"])" + re.escape(anchor)
+                              + r"(?![\w" + _apos + r"])")
+        _pat_ci  = re.compile(r"(?<![\w" + _apos + r"])" + re.escape(anchor)
+                              + r"(?![\w" + _apos + r"])", re.IGNORECASE)
+    except re.error:
+        _pat_cs = _pat_ci = None   # malformed anchor — fall through to raw find
+
+    idx = -1
+    is_ambiguous = False
+
+    # Tier 1: word-boundary, case-sensitive
+    if _pat_cs is not None:
+        m1 = _pat_cs.search(lyrics)
+        if m1:
+            idx = m1.start()
+            is_ambiguous = _pat_cs.search(lyrics, m1.end()) is not None
+
+    # Tier 2: word-boundary, case-insensitive
+    if idx == -1 and _pat_ci is not None:
+        m2 = _pat_ci.search(lyrics)
+        if m2:
+            idx = m2.start()
+            is_ambiguous = _pat_ci.search(lyrics, m2.end()) is not None
+
+    # Tier 3: raw substring fallback (handles punctuation-spanning anchors)
     if idx == -1:
-        idx = lyrics.lower().find(anchor.lower())
+        idx = lyrics.find(anchor)
         if idx == -1:
-            return None
+            idx = lyrics.lower().find(anchor.lower())
+            if idx == -1:
+                return None
+        second = lyrics.find(anchor, idx + 1)
+        if second == -1:
+            second = lyrics.lower().find(anchor.lower(), idx + 1)
+        is_ambiguous = second != -1
+
     span_end = idx + len(anchor)
-    second = lyrics.find(anchor, idx + 1)
-    if second == -1:
-        second = lyrics.lower().find(anchor.lower(), idx + 1)
-    is_ambiguous = second != -1
     if occ is None:
         occ = word_occurrences(lyrics)
     start_key = end_key = None
@@ -693,49 +719,6 @@ def vowel_stress_info(pron: str, vowel_idx: int):
     return (primary or secondary), primary
 
 
-def consonant_release_tip(consonants: list) -> str:
-    """Human-readable release tip for a list of IPA consonant symbols."""
-    if not consonants:
-        return ''
-    plosives    = [c for c in consonants if c in IPA_PLOSIVES]
-    nasals      = [c for c in consonants if c in IPA_NASALS]
-    approx      = [c for c in consonants if c in IPA_APPROXIMANTS]
-    fricatives  = [c for c in consonants if c in IPA_FRICATIVES]
-    lines = []
-    if plosives:
-        s = ' '.join(f'/{c}/' for c in plosives)
-        lines.append(f'Plosive exit ({s}) — snap off instantly. No shadow vowel after it.')
-    if nasals:
-        s = ' '.join(f'/{c}/' for c in nasals)
-        lines.append(f'Nasal exit ({s}) — sustain the vowel; place the nasal late and short. '
-                     f'It can carry pitch briefly into the release, but don\'t dwell on it.')
-    if approx:
-        for c in approx:
-            if c == 'l':
-                lines.append('/l/ exit — keep the tongue tip on the alveolar ridge; '
-                             'do not pull the root back. Release the sides gently.')
-            elif c in ('w', 'j'):
-                lines.append(f'/{c}/ exit — a glide; let it vanish smoothly into '
-                             'silence without a hard stop.')
-            elif c in ('ɹ', 'r'):
-                lines.append('/ɹ/ exit — release the tongue curl before the note ends; '
-                             'de-rhotacize for classical/legit.')
-            else:
-                lines.append(f'/{c}/ exit — gentle release; no hard cutoff.')
-    if fricatives:
-        IPA_VOICED_FRIC = {'v', 'z', 'ʒ', 'ð'}
-        voiced_f   = [c for c in fricatives if c in IPA_VOICED_FRIC]
-        unvoiced_f = [c for c in fricatives if c not in IPA_VOICED_FRIC]
-        if voiced_f:
-            s = ' '.join(f'/{c}/' for c in voiced_f)
-            lines.append(f'Voiced fricative exit ({s}) — these carry pitch and can '
-                         f'be lengthened for expressive weight. Use them as a sustain resource.')
-        if unvoiced_f:
-            s = ' '.join(f'/{c}/' for c in unvoiced_f)
-            lines.append(f'Unvoiced fricative exit ({s}) — dumps air; keep it brief '
-                         f'and controlled. Do not linger.')
-    return chr(10).join(lines)
-
 
 # R-colored consonant (trailing)
 IPA_RHOTIC = {'ɹ', 'r'}
@@ -752,9 +735,8 @@ IPA_SIBILANT = {'s', 'z', 'ʃ', 'ʒ', 'tʃ', 'dʒ'}
 # Vowel-glide routing: which semi-vowel to insert before next vowel
 # Front/central vowels → /j/ glide before next vowel
 _GLIDE_J = {'i','ɪ','e','ɛ','æ','ə','ɜ','ɐ','ɨ','eɪ','aɪ','ɔɪ','ɪə','eə'}
-# Back/round vowels → /w/ glide before next vowel
-_GLIDE_W = {'u','ʊ','o','ɔ','ʌ','ɑ','ɒ','oʊ','aʊ','ʊə'}
-# Anything in neither set (rare) defaults to /j/
+# Back/round vowels (u ʊ o ɔ ʌ ɑ ɒ oʊ aʊ ʊə) fall through to /w/.
+# Anything in neither set (rare) also defaults to /j/.
 
 
 def ipa_ends_with_vowel(pron: str) -> Optional[str]:
@@ -878,7 +860,8 @@ ALL_HINT_TYPES = frozenset({
 })
 
 
-def compute_word_tips(pron, next_ipa, has_punct_boundary, song_style, enabled):
+def compute_word_tips(pron, next_ipa, has_punct_boundary, song_style, enabled,
+                      is_emphatic=False):
     """Single source of truth for a word's diction tips.
 
     Returns an ordered list of (tip_type, tip_text). The first entry is the
@@ -889,6 +872,9 @@ def compute_word_tips(pron, next_ipa, has_punct_boundary, song_style, enabled):
     phrase-initial glottal/onset note instead. Both the inline lyric
     annotations (and therefore the cheat-sheet export) and the click-to-view
     word detail panel route through this function so all three views agree.
+
+    is_emphatic: True when the word is sustained or has a high/climax mark;
+                 gates certain style-dependent tips (r-toxicity in mt_ccm).
     """
     if enabled is None:
         enabled = ALL_HINT_TYPES
@@ -916,8 +902,15 @@ def compute_word_tips(pron, next_ipa, has_punct_boundary, song_style, enabled):
     # 2. Vowel-to-vowel glide (word ends on vowel, next starts vowel)
     elif end_vowel is not None and nlv is not None:
         glide = '/j/' if end_vowel in _GLIDE_J else '/w/'
-        tip = (f'Vowel-to-vowel — insert a soft {glide} glide to avoid '
-               f'a glottal stop before /{nlv}/. Keep airflow open.')
+        if song_style == 'mt_ccm':
+            tip = (f'Vowel-to-vowel — legit practice inserts a soft {glide} liaison; '
+                   f'contemporary often prefers a light speech-like separation '
+                   f'(or even a deliberate glottal) before /{nlv}/. '
+                   f'Choose by phrase intent — connect for lyric lines, '
+                   f'separate for conversational ones.')
+        else:
+            tip = (f'Vowel-to-vowel — insert a soft {glide} glide to avoid '
+                   f'a glottal stop before /{nlv}/. Keep airflow open.')
         tip_type = 'vowel_glide'
     # 3. Consonant crash
     elif trailing and nlc is not None:
@@ -925,12 +918,21 @@ def compute_word_tips(pron, next_ipa, has_punct_boundary, song_style, enabled):
         if crash:
             tip, tip_type = crash, 'crash'
 
-    # 4. R toxicity — stacks with the boundary tip; becomes primary if none yet
+    # 4. R toxicity — gated differently by style and emphatic status
     if (rhotics or has_rhotic_vowel) and 'r_toxicity' in enabled:
-        r_tip = ('American R — de-rhotacize: release the tongue curl/bunch '
-                 'before the note sustains. Sustain on the base vowel '
-                 '(ə or ɜ) instead of the r-colored form.')
-        if tip_type is None:
+        if song_style == 'mt_ccm' and not is_emphatic:
+            pass  # r-coloring on short notes is correct contemporary diction — skip
+        elif song_style == 'mt_ccm':
+            # emphatic in contemporary: sustain-release reminder
+            r_tip = ('American R — r-coloring is stylistically at home in MT/CCM. '
+                     'On short notes keep it; on long sustains, release the tongue '
+                     'curl/bunch late so the held tone rings on the base vowel '
+                     '(ə or ɜ) rather than the r-color, then re-form the r at the release.')
+        else:
+            r_tip = ('American R — de-rhotacize: release the tongue curl/bunch '
+                     'before the note sustains. Sustain on the base vowel '
+                     '(ə or ɜ) instead of the r-colored form.')
+        if r_tip is not None and tip_type is None:
             tip = r_tip
             tip_type = 'r_toxicity'
             r_tip = None
@@ -962,7 +964,6 @@ def compute_word_tips(pron, next_ipa, has_punct_boundary, song_style, enabled):
             tip_type = 'fricative'
 
     # No primary tip (or its type is disabled) -> caller may show glottal onset.
-    # Matches the engine: supplementary tips only stack on top of a primary.
     if tip_type is None or tip_type not in enabled:
         return []
 
@@ -979,7 +980,7 @@ def compute_word_tips(pron, next_ipa, has_punct_boundary, song_style, enabled):
         ng = _check_ng_release(pron)
         if ng:
             out.append(('ng_release', ng))
-    if 'diphthong' in enabled:
+    if 'diphthong' in enabled and song_style != 'mt_ccm':
         dt = _check_spurious_diphthong(pron)
         if dt:
             out.append(('diphthong', dt))
@@ -1318,6 +1319,8 @@ class Song:
     style: str = 'classical'  # 'classical' | 'mt_ccm'
     sustained_words: set = field(default_factory=set)  # words marked as sustained
     coaching_notes: list = field(default_factory=list)  # list[CoachingNote]
+    high_marks: dict = field(default_factory=dict)   # occ_key → 'high' | 'climax'
+    breath_marks: dict = field(default_factory=dict) # occ_key → 'full' | 'catch'
 
     def _present_words(self):
         """Set of lowercase words currently in the lyrics."""
@@ -1325,16 +1328,13 @@ class Song:
 
     def to_dict(self):
         pw = self._present_words()
-        # pron_choices keys are either a plain lowercase word (legacy / word-level
-        # default) or an occurrence key "word#N" (N = 0-based index of that word
-        # among all its occurrences in the lyrics). Keep a key only if its base
-        # word is still present and, for occurrence keys, the index is still valid.
         counts: dict = {}
         for m in WORD_RE.finditer(self.lyrics):
             wl = m.group().lower()
             counts[wl] = counts.get(wl, 0) + 1
 
-        def keep_pron(k: str) -> bool:
+        def _keep_key(k: str) -> bool:
+            """Return True if occurrence key k is still valid in the current lyrics."""
             if '#' in k:
                 base, _, idx = k.partition('#')
                 if base not in counts:
@@ -1347,10 +1347,12 @@ class Song:
 
         return {'name': self.name, 'lyrics': self.lyrics,
                 'custom_ipa': {k: v for k, v in self.custom_ipa.items() if k in pw},
-                'pron_choices': {k: v for k, v in self.pron_choices.items() if keep_pron(k)},
+                'pron_choices': {k: v for k, v in self.pron_choices.items() if _keep_key(k)},
                 'dismissed_tips': [w for w in self.dismissed_tips if w in pw],
                 'style': self.style,
                 'sustained_words': [w for w in self.sustained_words if w in pw],
+                'high_marks': {k: v for k, v in self.high_marks.items() if _keep_key(k)},
+                'breath_marks': {k: v for k, v in self.breath_marks.items() if _keep_key(k)},
                 'coaching_notes': [
                     {'start': n.anchor_start, 'end': n.anchor_end,
                      'text': n.text, 'anchor': n.anchor_text}
@@ -1366,6 +1368,8 @@ class Song:
                    dismissed_tips=set(d.get('dismissed_tips', [])),
                    style=d.get('style', 'classical'),
                    sustained_words=set(d.get('sustained_words', [])),
+                   high_marks=dict(d.get('high_marks', {})),
+                   breath_marks=dict(d.get('breath_marks', {})),
                    coaching_notes=[
                        CoachingNote(
                            d2.get('start', ''),
@@ -1758,12 +1762,16 @@ class LyricsEditor(QTextEdit):
     content_changed = pyqtSignal()
     annotation_dismissed = pyqtSignal(str)   # word_lower
     word_sustain_toggled = pyqtSignal(str)    # word_lower
+    word_high_mark_set = pyqtSignal(str, int, int, str)   # word_lower, bn, co, tier
+    word_breath_mark_set = pyqtSignal(str, int, int, str) # word_lower, bn, co, kind
 
     def __init__(self):
         super().__init__()
         self._annotation_map = {}   # (block, start, end) -> WordAnnotation
         self._hint_opacity: float = 1.0
         self._last_annotations: list = []
+        self._high_marks: list = []    # [(abs_start, abs_end, tier)]
+        self._breath_marks: list = []  # [(abs_end, kind)]
         self.setMouseTracking(True)
         self.setPlaceholderText(
             "Paste lyrics here. Click any word to see its IPA, vowel chart, "
@@ -1772,6 +1780,59 @@ class LyricsEditor(QTextEdit):
             "nouns like \"Valjean\" or prisoner numbers like \"24601\")."
         )
         self.textChanged.connect(self.content_changed.emit)
+        # Glyphs must repaint when the user scrolls
+        self.verticalScrollBar().valueChanged.connect(self.viewport().update)
+
+    def set_mark_overlays(self, high_list: list, breath_list: list):
+        """Store mark positions and trigger repaint."""
+        self._high_marks  = high_list
+        self._breath_marks = breath_list
+        self._rebuild_extra_selections()
+        self.viewport().update()
+
+    def _marker_pt(self) -> int:
+        """Font point size for mark glyphs (~60% of editor font, min 8)."""
+        return max(8, round(self.font().pointSize() * 0.62))
+
+    def paintEvent(self, ev):
+        super().paintEvent(ev)
+        if not self._high_marks and not self._breath_marks:
+            return
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.TextAntialiasing)
+        mfont = QFont('Segoe UI', self._marker_pt())
+        p.setFont(mfont)
+        mfm = QFontMetrics(mfont)
+        vp = self.viewport().rect()
+        # High-mark glyphs above each marked word
+        for (abs_s, abs_e, tier) in self._high_marks:
+            cur = QTextCursor(self.document())
+            cur.setPosition(abs_s)
+            r = self.cursorRect(cur)
+            if not vp.intersects(r):
+                continue
+            glyph = '▲▲' if tier == 'climax' else '▲'
+            color = '#e05050' if tier == 'climax' else '#d8a878'
+            p.setPen(QColor(color))
+            gw = mfm.horizontalAdvance(glyph)
+            p.drawText(r.left(), r.top() - 1, glyph)
+        # Breath glyphs just right of the marked word
+        for (abs_e, kind) in self._breath_marks:
+            cur = QTextCursor(self.document())
+            cur.setPosition(abs_e)
+            r = self.cursorRect(cur)
+            if not vp.intersects(r):
+                continue
+            if kind == 'full':
+                glyph, color = '✓', '#78b8a0'
+                p.setFont(mfont)
+            else:
+                glyph, color = "'", '#c8a060'
+                p.setFont(self.font())
+            p.setPen(QColor(color))
+            p.drawText(r.left() + _scale(2), r.top(), glyph)
+        p.setFont(mfont)  # restore
+        p.end()
 
     def _word_at_cursor_pos(self, pos):
         cursor = self.cursorForPosition(pos)
@@ -1785,21 +1846,31 @@ class LyricsEditor(QTextEdit):
 
     def set_annotations(self, annotations: list):
         """Apply background-tint + underline for all word annotations.
+        Multiple annotations for the same word range stack; the first (primary)
+        annotation owns the visual identity.  Tooltip shows all unique tip texts.
         Background tint is blended toward the editor base color by _hint_opacity
         (1.0 = full tint, 0.0 = invisible). Underlines are always solid at full
         color so the word remains flagged even at 0% opacity.
         """
         self._last_annotations = list(annotations)
-        self._annotation_map = {
-            (a.block, a.start, a.end): a for a in annotations
-        }
+        # Map (block, start, end) → list[WordAnnotation]; order preserved (primary first)
+        m: dict = {}
+        for a in annotations:
+            m.setdefault((a.block, a.start, a.end), []).append(a)
+        self._annotation_map = m
         self._rebuild_extra_selections()
 
     def _rebuild_extra_selections(self):
-        """Re-apply extra-selections using the current _hint_opacity."""
+        """Re-apply extra-selections using the current _hint_opacity.
+        One selection per word range; the primary (first) annotation supplies
+        the visual identity (color, underline style, bg tint).
+        """
         _EDITOR_BASE = '#1c2230'
         selections = []
-        for a in self._last_annotations:
+        # Use _annotation_map (deduplicated by range) rather than _last_annotations
+        # so we emit exactly one ExtraSelection per word, driven by anns[0].
+        for anns in self._annotation_map.values():
+            a = anns[0]  # primary annotation owns the visual
             cur = QTextCursor(self.document())
             cur.setPosition(a.abs_start)
             cur.setPosition(a.abs_end, QTextCursor.KeepAnchor)
@@ -1814,6 +1885,20 @@ class LyricsEditor(QTextEdit):
             sel.format = fmt
             selections.append(sel)
         self.setExtraSelections(selections)
+        # High-mark word decorations: overline + DemiBold/Bold weight
+        if self._high_marks:
+            for (abs_s, abs_e, tier) in self._high_marks:
+                cur = QTextCursor(self.document())
+                cur.setPosition(abs_s)
+                cur.setPosition(abs_e, QTextCursor.KeepAnchor)
+                fmt = QTextCharFormat()
+                fmt.setFontOverline(True)
+                fmt.setFontWeight(QFont.Bold if tier == 'climax' else QFont.DemiBold)
+                sel = QTextEdit.ExtraSelection()
+                sel.cursor = cur
+                sel.format = fmt
+                selections.append(sel)
+            self.setExtraSelections(selections)
 
     def set_highlight_opacity(self, opacity: float):
         """Set hint-highlight opacity [0.0, 1.0] and re-draw existing annotations."""
@@ -1826,19 +1911,21 @@ class LyricsEditor(QTextEdit):
         self.setExtraSelections([])
 
     def _annotation_at_pos(self, pos):
+        """Return the list of annotations for the word at *pos*, or empty list."""
         cur = self.cursorForPosition(pos)
         bn = cur.block().blockNumber()
         pip = cur.positionInBlock()
-        for (b, s, e), ann in self._annotation_map.items():
+        for (b, s, e), anns in self._annotation_map.items():
             if b == bn and s <= pip <= e:
-                return ann
-        return None
+                return anns
+        return []
 
     def mouseMoveEvent(self, event):
         super().mouseMoveEvent(event)
-        ann = self._annotation_at_pos(event.pos())
-        if ann:
-            QToolTip.showText(event.globalPos(), ann.tip_text, self)
+        anns = self._annotation_at_pos(event.pos())
+        if anns:
+            tip = '\n\n'.join(dict.fromkeys(a.tip_text for a in anns))
+            QToolTip.showText(event.globalPos(), tip, self)
         else:
             QToolTip.hideText()
 
@@ -1851,14 +1938,15 @@ class LyricsEditor(QTextEdit):
 
     def contextMenuEvent(self, event):
         menu = self.createStandardContextMenu()
-        word, _, _offset = self._word_at_cursor_pos(event.pos())
-        ann = self._annotation_at_pos(event.pos())
+        word, bn, co = self._word_at_cursor_pos(event.pos())
+        anns = self._annotation_at_pos(event.pos())
         if word:
             menu.addSeparator()
             action = menu.addAction(f'Set custom IPA for "{word}"…')
             action.triggered.connect(
                 lambda _, w=word: self.word_ipa_requested.emit(w.lower()))
-        if ann:
+        if anns:
+            ann = anns[0]  # primary annotation for the dismiss label
             da = menu.addAction(f'Dismiss hint for "{ann.word}"')
             da.triggered.connect(
                 lambda _, w=ann.word_lower: self.annotation_dismissed.emit(w))
@@ -1867,6 +1955,23 @@ class LyricsEditor(QTextEdit):
             sa = menu.addAction(f'Toggle sustained note on "{word}"')
             sa.triggered.connect(
                 lambda _, w=word.lower(): self.word_sustain_toggled.emit(w))
+
+            # ── High-note submenu ──────────────────────────────────────────
+            high_menu = menu.addMenu(f'High note on "{word}"')
+            for label, tier in [('None', ''), ('High ▲', 'high'), ('Climax ▲▲', 'climax')]:
+                a = high_menu.addAction(label)
+                a.triggered.connect(
+                    lambda _, _w=word.lower(), _bn=bn, _co=co, _t=tier:
+                        self.word_high_mark_set.emit(_w, _bn, _co, _t))
+
+            # ── Breath-mark submenu ────────────────────────────────────────
+            breath_menu = menu.addMenu(f'Breath after "{word}"')
+            for label, kind in [('None', ''), ("Full breath ✓", 'full'), ("Catch-breath '", 'catch')]:
+                a = breath_menu.addAction(label)
+                a.triggered.connect(
+                    lambda _, _w=word.lower(), _bn=bn, _co=co, _k=kind:
+                        self.word_breath_mark_set.emit(_w, _bn, _co, _k))
+
         menu.exec_(event.globalPos())
 
     def line_text(self, block_number: int) -> str:
@@ -2344,6 +2449,26 @@ class CoachingView(QWidget):
             p.setPen(QColor(self._C_TEXT))
             p.drawText(wi['x'], wi['y'], wi['pw'] + pad, wi['h'],
                        Qt.AlignLeft | Qt.AlignVCenter, wi['word'])
+            # ── high-note / breath mark glyphs ────────────────────────────
+            if self._song is not None:
+                key = wi['key']
+                if key in self._song.high_marks:
+                    tier_ = self._song.high_marks[key]
+                    mglyph = '▲▲' if tier_ == 'climax' else '▲'
+                    mclr   = '#e05050' if tier_ == 'climax' else '#d8a878'
+                    mfont  = QFont('Segoe UI', max(7, round(font.pointSize() * 0.6)))
+                    p.setFont(mfont)
+                    p.setPen(QColor(mclr))
+                    p.drawText(wi['x'], wi['y'] - _scale(1), mglyph)
+                    p.setFont(font)
+                if key in self._song.breath_marks:
+                    bkind_ = self._song.breath_marks[key]
+                    bglyph = '✓' if bkind_ == 'full' else "'"
+                    bclr   = '#78b8a0' if bkind_ == 'full' else '#c8a060'
+                    p.setPen(QColor(bclr))
+                    p.drawText(wi['x'] + wi['pw'] + pad + _scale(1),
+                               wi['y'], wi['pw'], wi['h'],
+                               Qt.AlignLeft | Qt.AlignVCenter, bglyph)
 
         # ── draw bubbles ──────────────────────────────────────────────────────
         c_bub_bg     = QColor(self._C_BUB_BG)
@@ -2753,6 +2878,9 @@ class LyricsIpaView(QWidget):
         self._ann_map: dict = {}     # (bn, co) → list[WordAnnotation]
         self._hints_enabled: bool = False
         self._hint_opacity: float = 0.5
+        # Mark overlay state
+        self._high_bnco: dict = {}   # (bn, co) → tier
+        self._breath_bnco: dict = {} # (bn, co) → kind
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -2762,6 +2890,12 @@ class LyricsIpaView(QWidget):
         """*blocks*: list of per-line lists of (word, ipa_str, block_number, char_offset)."""
         self._blocks = blocks
         self._relayout()
+
+    def set_mark_overlays(self, high_bnco: dict, breath_bnco: dict):
+        """Update high/breath mark overlays keyed by (block_number, char_offset)."""
+        self._high_bnco  = high_bnco
+        self._breath_bnco = breath_bnco
+        self.update()
 
     def set_annotations(self, annotations: list, enabled: bool):
         """Update the diction-hint overlay.  *annotations* is the same list that
@@ -2801,6 +2935,8 @@ class LyricsIpaView(QWidget):
         boundingRect().right() + 1 gives the rightmost ink pixel from draw
         position 0, which is what actually matters for clip avoidance.
         A generous fixed pad covers any remaining sub-pixel / rounding slop.
+        Paint calls also pass Qt.TextDontClip so metric underestimates can never
+        clip ink; the cell width governs layout/centering only.
         """
         br = ifm.boundingRect(s)
         # br.right() is the inclusive rightmost x of the ink rect relative to
@@ -2944,13 +3080,33 @@ class LyricsIpaView(QWidget):
                     p.setFont(wfont)
                     p.setPen(QColor(self._C_TEXT))
                     p.drawText(word_x, y, ww + _scale(2), wlh,
-                               Qt.AlignLeft | Qt.AlignVCenter, word)
+                               Qt.AlignLeft | Qt.AlignVCenter | Qt.TextDontClip, word)
                     # IPA centered beneath it (iw already includes right padding)
                     ipa_x = x + (cell_w - iw) // 2
                     p.setFont(ifont)
                     p.setPen(QColor(self._C_MUTED))
                     p.drawText(ipa_x, y + wlh + ipa_gap, iw, ilh,
-                               Qt.AlignLeft | Qt.AlignVCenter, ipa_str)
+                               Qt.AlignLeft | Qt.AlignVCenter | Qt.TextDontClip, ipa_str)
+                    # ── mark glyphs ──────────────────────────────────────
+                    if self._high_bnco or self._breath_bnco:
+                        mfont = QFont('Segoe UI', max(7, round(self._font_pt * 0.55)))
+                        mfm   = QFontMetrics(mfont)
+                        p.setFont(mfont)
+                        if (bn, co) in self._high_bnco:
+                            tier_  = self._high_bnco[(bn, co)]
+                            mglyph = '▲▲' if tier_ == 'climax' else '▲'
+                            mclr   = '#e05050' if tier_ == 'climax' else '#d8a878'
+                            p.setPen(QColor(mclr))
+                            mgw = mfm.horizontalAdvance(mglyph)
+                            p.drawText(word_x + (ww - mgw) // 2,
+                                       y - mfm.ascent() + _scale(1), mglyph)
+                        if (bn, co) in self._breath_bnco:
+                            bkind_ = self._breath_bnco[(bn, co)]
+                            bglyph = '✓' if bkind_ == 'full' else "'"
+                            bclr   = '#78b8a0' if bkind_ == 'full' else '#c8a060'
+                            p.setPen(QColor(bclr))
+                            p.drawText(x + cell_w + _scale(1), y, bglyph)
+                        p.setFont(wfont)  # restore for next cell
                     x += cell_w + word_gap
                 y += pair_h + row_gap
 
@@ -3134,6 +3290,7 @@ class ArticulationCard(QFrame):
         super().__init__()
         self.setObjectName('ArticulationCard')
         self.setFrameShape(QFrame.StyledPanel)
+        self._song_style = 'classical'  # updated by MainWindow on load/style-change
 
         self.title = QLabel('Select a vowel above')
         self.title.setObjectName('CardTitle')
@@ -3168,6 +3325,13 @@ class ArticulationCard(QFrame):
         self.stress_warning.setTextInteractionFlags(
             Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.stress_warning.setVisible(False)
+
+        self.high_label = QLabel('')
+        self.high_label.setObjectName('LegatoTip')
+        self.high_label.setWordWrap(True)
+        self.high_label.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        self.high_label.setVisible(False)
 
         self.sustained_label = QLabel('')
         self.sustained_label.setObjectName('LegatoTip')
@@ -3204,6 +3368,7 @@ class ArticulationCard(QFrame):
         layout.addWidget(self.brightness_bar)
         layout.addWidget(self.notes)
         layout.addWidget(self.stress_warning)
+        layout.addWidget(self.high_label)
         layout.addWidget(self.sustained_label)
         layout.addSpacing(_scale(10))
         layout.addWidget(self.section_header)
@@ -3214,6 +3379,10 @@ class ArticulationCard(QFrame):
     def set_stress_warning(self, text: str):
         self.stress_warning.setText(text)
         self.stress_warning.setVisible(bool(text))
+
+    def set_style(self, style: str):
+        """Store song style; captions rebuild on next show_phone call."""
+        self._song_style = style
 
     def show_phone(self, sym):
         if sym in DIPHTHONGS:
@@ -3231,6 +3400,7 @@ class ArticulationCard(QFrame):
         self.notes.setText('')
         self.brightness_bar.set_brightness(None)
         self.set_stress_warning('')
+        self.high_label.setVisible(False)
         self.sustained_label.setVisible(False)
         self.section_header.setText('')
         self.section_caption.setText('')
@@ -3253,9 +3423,15 @@ class ArticulationCard(QFrame):
 
         self.section_header.setText('MODIFICATION AT HIGH PITCH')
         if v.mod_high and v.mod_high in VOWELS:
-            self.section_caption.setText(
-                "As pitch rises, this vowel relaxes toward the target on the "
-                "right. Click either step to hear it.")
+            if self._song_style == 'mt_ccm':
+                cap = ('Legit practice relaxes toward the target on the right as pitch rises. '
+                       'Contemporary/belt practice modifies less — keep the speech vowel and its '
+                       'brightness higher, narrow rather than round, and let mix placement do the '
+                       'work. Treat the arrow as the legit option, not a default.')
+            else:
+                cap = ('As pitch rises, this vowel relaxes toward the target on the '
+                       'right. Click either step to hear it.')
+            self.section_caption.setText(cap)
             self._build_ladder([sym, v.mod_high])
             self.ladder_axis.setText(
                 '← comfortable pitch        ·        higher pitch →')
@@ -3284,9 +3460,13 @@ class ArticulationCard(QFrame):
         self.notes.setText(d.singing_note)
 
         self.section_header.setText('DIPHTHONG GLIDE')
-        self.section_caption.setText(
-            "Sustain on the primary vowel for almost the whole duration. "
-            "Vanish to the glide only at the very end. Click either to hear it.")
+        cap = ("Sustain on the primary vowel for almost the whole duration. "
+               "Vanish to the glide only at the very end. Click either to hear it.")
+        if self._song_style == 'mt_ccm':
+            cap += (' Contemporary note: speech-timed diphthongs are idiomatic here — '
+                    'the glide may arrive earlier, and shading toward the glide can be '
+                    'a stylistic color rather than a fault.')
+        self.section_caption.setText(cap)
         self._build_ladder([d.primary, d.glide], glide_labels=True)
         self.ladder_axis.setText(
             '← sustain (most of the note)        ·        vanish (final ms) →')
@@ -3408,7 +3588,7 @@ class PhraseTrajectoryBar(QWidget):
             p.setFont(f_label)
             label_y = bar_top + bar_h + _scale(2)
             p.drawText(cell_x, label_y, cell_w, fm_label.height(),
-                       Qt.AlignCenter, vsym)
+                       Qt.AlignCenter | Qt.TextDontClip, vsym)
 
             x += cell_total_w
 
@@ -3435,6 +3615,7 @@ class AnalysisPanel(QWidget):
         self._current_word = ''
         self._current_syllables = []
         self._next_ipa = None
+        self._last_syllable_idx = 0
 
         word_header = QWidget()
         wh_layout = QHBoxLayout(word_header)
@@ -3520,7 +3701,8 @@ class AnalysisPanel(QWidget):
         self.chart_container.setMinimumHeight(round(360 * scale))
 
     def show_word(self, word, pronunciations, initial_index=0, next_ipa=None,
-                  song_style='classical', enabled_hints=None, has_punct_boundary=False):
+                  song_style='classical', enabled_hints=None, has_punct_boundary=False,
+                  is_emphatic=False, high_tier=''):
         self._pronunciations = pronunciations
         self._current_pron_index = 0
         self._current_word = word
@@ -3528,6 +3710,8 @@ class AnalysisPanel(QWidget):
         self._song_style = song_style
         self._enabled_hints = enabled_hints
         self._has_punct_boundary = has_punct_boundary
+        self._is_emphatic = is_emphatic
+        self._high_tier = high_tier
         self.word_label.setText(word)
         self.speak_btn.setEnabled(bool(word and word != 'Click a word to begin'))
 
@@ -3544,11 +3728,14 @@ class AnalysisPanel(QWidget):
             self.speak_btn.setEnabled(False)
             self.legato_tip.setVisible(False)
             self.consonant_tip.setVisible(False)
+            self.card.high_label.setVisible(False)
+            self._last_syllable_idx = 0
             return
 
         self._populate_alts(pronunciations)
         idx = initial_index if 0 <= initial_index < len(pronunciations) else 0
         self._select_pronunciation(idx)
+        self._show_high_tips()
 
     def _populate_alts(self, pronunciations):
         self._clear_alts()
@@ -3624,8 +3811,7 @@ class AnalysisPanel(QWidget):
         if index is None and sym is not None:
             # When multiple syllables share the same symbol (e.g. "bobo" → /oʊ/,/oʊ/),
             # prefer the syllable nearest the current one rather than always the first.
-            # Falls back to first match if no current index is tracked.
-            cur = self._current_pron_index  # reuse as a rough "last syllable touched" hint
+            cur = self._last_syllable_idx  # dedicated syllable-position tracker
             best = None
             best_dist = float('inf')
             for i, (s, _, _) in enumerate(self._current_syllables):
@@ -3652,19 +3838,16 @@ class AnalysisPanel(QWidget):
 
         self._update_stress_warning(index)
         if index is not None and index >= 0:
+            self._last_syllable_idx = index
             self.vowel_selected.emit(index)
 
     def _update_word_tips(self, pron: str):
-        """Refresh the panel tips from the shared tip engine, so the panel, the
-        hover tooltip, and the cheat-sheet export all show the same advice.
-        The primary boundary tip goes in the top label; any stacked notes
-        (r-toxicity, /ŋ/, yod, spurious diphthong, /h/) go in the second.
-        """
         tips = compute_word_tips(
             pron, self._next_ipa,
             getattr(self, '_has_punct_boundary', False),
             getattr(self, '_song_style', 'classical'),
-            getattr(self, '_enabled_hints', None))
+            getattr(self, '_enabled_hints', None),
+            is_emphatic=getattr(self, '_is_emphatic', False))
 
         boundary = {'legato', 'vowel_glide', 'crash'}
         legato_text = next((txt for tt, txt in tips if tt in boundary), '')
@@ -3719,7 +3902,25 @@ class AnalysisPanel(QWidget):
             if item.widget():
                 item.widget().deleteLater()
 
-    def _show_sustained_tips(self, is_sustained: bool, vowel: Optional[str]):
+    def _show_high_tips(self):
+        """Show or hide the high-note/climax banner in the articulation card."""
+        tier = getattr(self, '_high_tier', '')
+        if not tier:
+            self.card.high_label.setVisible(False)
+            return
+        if tier == 'climax':
+            text = ('▲▲ Marked climax — this is the note the song is built around. '
+                    'Commit to one vowel plan (ladder below), take the fullest breath '
+                    'the phrasing allows beforehand, release jaw and neck on the approach, '
+                    'and let support — not throat squeeze — carry the intensity.')
+        else:
+            text = ('▲ Marked high note — plan the vowel before you arrive. '
+                    'Check the modification ladder below; decide the target shape '
+                    'in practice, not mid-phrase. Set breath and space one beat early.')
+        self.card.high_label.setText(text)
+        self.card.high_label.setVisible(True)
+
+    def _show_sustained_tips(self, is_sustained: bool, vowel):
         """Show or hide sustained-note pedagogy in the articulation card."""
         if not is_sustained or vowel is None:
             self.card.sustained_label.setVisible(False)
@@ -3984,10 +4185,38 @@ class MainWindow(QMainWindow):
         self.player = QMediaPlayer()
         self.setWindowIcon(_app_icon())
 
-        app_data = QStandardPaths.writableLocation(
+        # ── Resolve save directory ──────────────────────────────────────────────
+        # Priority order:
+        #   1. User-configured 'saveDir' in QSettings (pinned on first run).
+        #   2. Platform default — written back into settings so it stays pinned
+        #      even if the application name changes in the future.
+        # If a stored saveDir exists but is currently inaccessible (e.g. removed
+        # drive), warn and fall back for this session without overwriting the key.
+        _default_data = QStandardPaths.writableLocation(
             QStandardPaths.AppLocalDataLocation)
-        if not app_data:
-            app_data = os.path.expanduser('~/.lyric_ipa_finder')
+        if not _default_data:
+            _default_data = os.path.expanduser('~/.lyric_ipa_finder')
+
+        if self.settings.contains('saveDir'):
+            _stored = self.settings.value('saveDir', '')
+            try:
+                os.makedirs(_stored, exist_ok=True)
+                app_data = _stored          # stored path is reachable — use it
+            except OSError:
+                # Drive or path inaccessible; fall back for this session only
+                app_data = _default_data
+                QMessageBox.warning(
+                    None, 'Save Folder Unreachable',
+                    f'The configured save folder is not accessible:\n{_stored}\n\n'
+                    f'Using the default location for this session:\n{app_data}\n\n'
+                    f'Your setting has been kept so it recovers when the path '
+                    f'becomes available again.')
+        else:
+            # First run (or settings cleared) — pin the default so future renames
+            # of the application name never silently relocate songs.json.
+            app_data = _default_data
+            self.settings.setValue('saveDir', app_data)
+
         self.store = SongStore(app_data)
         self.songs, self.active_index = self.store.load()
 
@@ -3999,16 +4228,24 @@ class MainWindow(QMainWindow):
         self._current_clicked_occ_key = None  # "word#N" for the last-clicked occurrence
         self._current_char_offset = -1  # in-block offset of the last-clicked word
         self._missing_audio_warned: set = set()  # warn once per missing symbol
-        # Sequential vowel playback (Play line vowels) — hold-cap model:
-        # each vowel sounds for at most _seq_hold_ms ms, then advances.
+        # Sequential vowel playback (Play line vowels) — gap model:
+        # clips play in full; presets set the inter-vowel gap;
+        # _seq_hold is only a stall watchdog.
         self._vowel_seq: list = []
         self._vowel_seq_idx = 0
         self._vowel_seq_active = False
-        self._seq_hold_ms: int = 320   # default: Fast preset
+        self._seq_gap_ms: int = 0     # Normal preset: no gap between vowels
+        self._seq_rate: float = 1.0   # playback rate for current preset
+        self._seq_variant: str = ''   # Audio/ subfolder for current preset
+        # Watchdog: recovers the sequence if a clip stalls and never ends.
         self._seq_hold = QTimer(self)
         self._seq_hold.setSingleShot(True)
-        self._seq_hold.setInterval(self._seq_hold_ms)
         self._seq_hold.timeout.connect(self._on_seq_hold_elapsed)
+        # Gap between vowels (Slow preset)
+        self._seq_gap = QTimer(self)
+        self._seq_gap.setSingleShot(True)
+        self._seq_gap.timeout.connect(self._advance_vowel_seq)
+        self._seq_vowel_done: bool = False
         self.player.mediaStatusChanged.connect(self._on_media_status)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -4048,6 +4285,8 @@ class MainWindow(QMainWindow):
         self.editor.content_changed.connect(self._on_lyrics_changed)
         self.editor.annotation_dismissed.connect(self._on_annotation_dismissed)
         self.editor.word_sustain_toggled.connect(self._on_word_sustain_toggled)
+        self.editor.word_high_mark_set.connect(self._on_word_high_mark_set)
+        self.editor.word_breath_mark_set.connect(self._on_word_breath_mark_set)
 
         editor_container = QWidget()
         ec_layout = QVBoxLayout(editor_container)
@@ -4176,10 +4415,11 @@ class MainWindow(QMainWindow):
         self._seq_speed_label.setObjectName('Caption')
         self._seq_speed_combo = QComboBox()
         self._seq_speed_combo.setToolTip(
-            'Maximum sounding duration per vowel when playing the line in sequence.')
-        for label, ms in self._SEQ_SPEED_PRESETS:
-            self._seq_speed_combo.addItem(label, ms)
-        self._seq_speed_combo.setCurrentIndex(0)  # default: Fast (320 ms hold)
+            'Pause between vowels when playing the line in sequence.\n'
+            'Each vowel sample always plays in full.')
+        for i, (label, _gap, _rate, _variant) in enumerate(self._SEQ_SPEED_PRESETS):
+            self._seq_speed_combo.addItem(label, i)
+        self._seq_speed_combo.setCurrentIndex(0)  # default: Normal (no gap)
         self._seq_speed_combo.currentIndexChanged.connect(self._on_seq_speed_changed)
         th_layout.addWidget(self._seq_speed_label)
         th_layout.addWidget(self._seq_speed_combo)
@@ -4204,6 +4444,11 @@ class MainWindow(QMainWindow):
         self.breath_label.setWordWrap(True)
         self.breath_label.setVisible(False)
         ec_layout.addWidget(self.breath_label)
+        self.phrase_budget_label = QLabel('')
+        self.phrase_budget_label.setObjectName('ChiaroscuroTip')
+        self.phrase_budget_label.setWordWrap(True)
+        self.phrase_budget_label.setVisible(False)
+        ec_layout.addWidget(self.phrase_budget_label)
 
         self.analysis = AnalysisPanel()
         self.analysis.play_requested.connect(self._play_vowel)
@@ -4244,6 +4489,9 @@ class MainWindow(QMainWindow):
         a = QAction('&Import Coaching Notes…', self)
         a.triggered.connect(self._on_import_coaching_notes)
         s.addAction(a)
+        a = QAction('Tension Watchlist…', self)
+        a.triggered.connect(self._on_show_tension_watchlist)
+        s.addAction(a)
         s.addSeparator()
         a = QAction('Export Cheat Sheet (Markdown)...', self)
         a.triggered.connect(lambda: self._on_export_cheat_sheet('md'))
@@ -4256,6 +4504,9 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._on_reset_dismissed_hints)
         s.addAction(a)
         s.addSeparator()
+        a = QAction('Change Save Folder…', self)
+        a.triggered.connect(self._on_change_save_folder)
+        s.addAction(a)
         a = QAction('Open Save Folder', self)
         a.triggered.connect(self._on_open_save_folder)
         s.addAction(a)
@@ -4416,6 +4667,8 @@ class MainWindow(QMainWindow):
         self._pron_cache.clear()
         self._pron_index_cache = dict(song.pron_choices)
         self._update_style_btn_label()
+        if hasattr(self, 'analysis'):
+            self.analysis.card.set_style(getattr(self.active_song, 'style', 'classical'))
         self._annotation_timer.start()   # recompute hints after load
         self.analysis.show_word('Click a word to begin', [])
         self.trajectory.set_phrase([])
@@ -4425,10 +4678,13 @@ class MainWindow(QMainWindow):
         self._current_clicked_occ_key = None
         self._current_char_offset = -1
         self._vowel_seq_active = False
+        if hasattr(self, 'phrase_budget_label'):
+            self.phrase_budget_label.setVisible(False)
         self._update_missing_ipa_indicator()
         if hasattr(self, 'coaching_view'):
             self._reanchor_notes_to_lyrics(song)
             self.coaching_view.set_song(song)
+        self._refresh_mark_overlays()
         # Always return to the lyrics editor when switching songs
         if hasattr(self, 'lyrics_stack'):
             self.lyrics_stack.setCurrentIndex(0)
@@ -4462,6 +4718,63 @@ class MainWindow(QMainWindow):
         if changed:
             self._schedule_save()
 
+    def _mark_positions(self):
+        """Single tokenize pass → (high_list, breath_list, high_bnco, breath_bnco).
+
+        high_list   = [(abs_start, abs_end, tier)]
+        breath_list = [(abs_end, kind)]
+        high_bnco   = {(bn, co): tier}  for LyricsIpaView
+        breath_bnco = {(bn, co): kind}
+        """
+        song = self.active_song
+        if not song.high_marks and not song.breath_marks:
+            return [], [], {}, {}
+        text = self.editor.toPlainText()
+        occ  = word_occurrences(text)
+        high_list, breath_list = [], []
+        high_bnco, breath_bnco = {}, {}
+        # track line bases for (bn, co) derivation
+        line_starts = [0]
+        for ch in text:
+            if ch == '\n':
+                line_starts.append(line_starts[-1] + 1)
+            else:
+                line_starts[-1] += 1
+        # rebuild as cumulative offsets
+        cumul = [0]
+        for ln in text.splitlines():
+            cumul.append(cumul[-1] + len(ln) + 1)
+
+        for wm, wkey in occ:
+            if wkey in song.high_marks:
+                tier = song.high_marks[wkey]
+                abs_s, abs_e = wm.start(), wm.end()
+                high_list.append((abs_s, abs_e, tier))
+                # derive (bn, co) from abs position
+                bn = next((i for i in range(len(cumul)-1, -1, -1)
+                           if cumul[i] <= abs_s), 0)
+                co = abs_s - cumul[bn]
+                high_bnco[(bn, co)] = tier
+            if wkey in song.breath_marks:
+                kind = song.breath_marks[wkey]
+                abs_e = wm.end()
+                breath_list.append((abs_e, kind))
+                bn = next((i for i in range(len(cumul)-1, -1, -1)
+                           if cumul[i] <= wm.start()), 0)
+                co = wm.start() - cumul[bn]
+                breath_bnco[(bn, co)] = kind
+        return high_list, breath_list, high_bnco, breath_bnco
+
+    def _refresh_mark_overlays(self):
+        """Push mark data into all three views."""
+        high_list, breath_list, high_bnco, breath_bnco = self._mark_positions()
+        if hasattr(self, 'editor'):
+            self.editor.set_mark_overlays(high_list, breath_list)
+        if hasattr(self, 'ipa_view'):
+            self.ipa_view.set_mark_overlays(high_bnco, breath_bnco)
+        if hasattr(self, 'coaching_view'):
+            self.coaching_view.update()
+
     def _on_song_changed(self, idx):
         if idx < 0 or idx >= len(self.songs) or idx == self.active_index:
             return
@@ -4490,16 +4803,6 @@ class MainWindow(QMainWindow):
             self.ipa_view.set_view_data(blocks)
             self.ipa_view.set_annotations(self._word_annotations, self._ipa_hints_enabled)
             self.lyrics_stack.setCurrentIndex(2)
-
-    def _on_coaching_toggle(self, checked: bool):
-        """Switch between the live editor (page 0) and the coaching view (page 1).
-        Kept for backward compatibility; the main UI now uses _on_view_btn_clicked."""
-        if checked:
-            self.active_song.lyrics = self.editor.toPlainText()
-            self.coaching_view.set_song(self.active_song)
-            self.lyrics_stack.setCurrentIndex(1)
-        else:
-            self.lyrics_stack.setCurrentIndex(0)
 
     def _on_new_song(self):
         name, ok = QInputDialog.getText(
@@ -4541,6 +4844,7 @@ class MainWindow(QMainWindow):
         self.active_song.lyrics = self.editor.toPlainText()
         self._schedule_save()
         self._annotation_timer.start()
+        self._refresh_mark_overlays()
         # If IPA view is currently shown, keep it in sync
         if (hasattr(self, 'lyrics_stack') and
                 self.lyrics_stack.currentIndex() == 2):
@@ -4576,14 +4880,14 @@ class MainWindow(QMainWindow):
         else:
             custom[word_l] = new
         self._pron_cache.pop(word_l, None)
-        if self._current_block_number >= 0:
-            line = self.editor.line_text(self._current_block_number)
-            self._update_trajectory(line)
-            if self.analysis.word_label.text() == word_l:
-                prons = self._cached_pronunciations(word_l)
-                self.analysis.show_word(word_l, prons)
         self._schedule_save()
         self._annotation_timer.start()
+        # Re-dispatch through the canonical click path so next-word context,
+        # preferred index, style, hints, and trajectory all update in one shot.
+        if (self.analysis.word_label.text() == word_l
+                and self._current_block_number >= 0):
+            self._on_word_clicked(word_l, self._current_block_number,
+                                  self._current_char_offset)
 
     # ---- Word handling ----
 
@@ -4657,19 +4961,26 @@ class MainWindow(QMainWindow):
 
     # ---- Sequential playback speed presets ----
 
-    # (label, gap_ms) — gap inserted between vowels after audio finishes
+    # (label, gap_ms, rate, variant) — gap is the pause between vowels
+    # after each clip plays to its natural end.  variant names an Audio/
+    # subfolder of pre-rendered pitch-preserving clips to prefer; rate is
+    # the setPlaybackRate fallback used only when no variant file exists
+    # (resampled, so pitch rises).  Clips are never truncated.
     _SEQ_SPEED_PRESETS = [
-        ('Fast',   320),
-        ('Faster', 170),
+        ('Fast',   0,   1.5, 'fast'),
+        ('Normal', 0,   1.0, ''),
+        ('Slow',   350, 1.0, ''),
     ]
 
     def _on_seq_speed_changed(self, index: int):
-        ms = self._seq_speed_combo.itemData(index)
-        if ms is None:
+        pi = self._seq_speed_combo.itemData(index)
+        if pi is None:
             return
-        self._seq_hold_ms = int(ms)
-        self._seq_hold.setInterval(self._seq_hold_ms)
-        self.settings.setValue('seqHoldMs', self._seq_hold_ms)
+        label, gap, rate, variant = self._SEQ_SPEED_PRESETS[int(pi)]
+        self._seq_gap_ms = int(gap)
+        self._seq_rate = float(rate)
+        self._seq_variant = variant
+        self.settings.setValue('seqPresetLabel', label)
 
     # ---- Inline annotation hints ----
 
@@ -4693,12 +5004,12 @@ class MainWindow(QMainWindow):
 
     def _build_style_menu(self) -> QMenu:
         menu = QMenu(self)
-        self._act_style_classical = QAction('Classical / Legit', menu)
+        self._act_style_classical = QAction('Legit / Classical', menu)
         self._act_style_classical.setCheckable(True)
         self._act_style_classical.triggered.connect(
             lambda: self._on_style_changed('classical'))
         menu.addAction(self._act_style_classical)
-        self._act_style_mt = QAction('MT / CCM / Pop', menu)
+        self._act_style_mt = QAction('Contemporary / Pop-MT', menu)
         self._act_style_mt.setCheckable(True)
         self._act_style_mt.triggered.connect(
             lambda: self._on_style_changed('mt_ccm'))
@@ -4708,12 +5019,12 @@ class MainWindow(QMainWindow):
     def _update_style_btn_label(self):
         style = self.active_song.style if hasattr(self, 'songs') else 'classical'
         if style == 'mt_ccm':
-            self.style_btn.setText('MT/CCM')
+            self.style_btn.setText('CONTEMPORARY')
             if hasattr(self, '_act_style_mt'):
                 self._act_style_mt.setChecked(True)
                 self._act_style_classical.setChecked(False)
         else:
-            self.style_btn.setText('CLASSICAL')
+            self.style_btn.setText('LEGIT')
             if hasattr(self, '_act_style_classical'):
                 self._act_style_classical.setChecked(True)
                 self._act_style_mt.setChecked(False)
@@ -4721,19 +5032,16 @@ class MainWindow(QMainWindow):
     def _on_style_changed(self, style: str):
         self.active_song.style = style
         self._update_style_btn_label()
+        self.analysis.card.set_style(style)
         self._schedule_save()
         self._compute_annotations()
-        # Rerun analysis panel tips for current word if any
+        # Re-dispatch through the canonical click path so tips, card caption,
+        # and is_emphatic all update correctly
         word = self.analysis.word_label.text()
-        if word and word != 'Click a word to begin':
-            abs_start = self._abs_offset(self._current_block_number,
-                                         self._current_char_offset)
-            prons = self._context_aware_pronunciations(word, self._get_next_word_ipa(
-                self.editor.line_text(self._current_block_number), word)
-                if self._current_block_number >= 0 else None)
-            preferred = self._preferred_index(word.lower(), abs_start)
-            if prons:
-                self.analysis._update_word_tips(prons[min(preferred, len(prons)-1)])
+        if (word and word != 'Click a word to begin'
+                and self._current_block_number >= 0):
+            self._on_word_clicked(word, self._current_block_number,
+                                  self._current_char_offset)
 
     def _build_hints_menu(self) -> QMenu:
         menu = QMenu(self)
@@ -4823,6 +5131,10 @@ class MainWindow(QMainWindow):
         doc = self.editor.document()
         dismissed = self.active_song.dismissed_tips
         song_style = getattr(self.active_song, 'style', 'classical')
+        high_marks = self.active_song.high_marks
+        # One tokenise pass → abs_start → occ_key (for is_emphatic lookup)
+        full_text = self.editor.toPlainText()
+        _abs_to_key = {wm.start(): wkey for wm, wkey in word_occurrences(full_text)}
         annotations = []
 
         for block_num in range(doc.blockCount()):
@@ -4835,38 +5147,47 @@ class MainWindow(QMainWindow):
                 word_l = word.lower()
                 if word_l in dismissed:
                     continue
+                abs_s = block.position() + m.start()
+                occ_key = _abs_to_key.get(abs_s, '')
+                is_emphatic = (word_l in self.active_song.sustained_words or
+                               occ_key in high_marks)
 
-                # ── glottal onset check (this word opens a phrase) ────────
-                # True if word is first on the line, or preceded by punctuation.
-                # Stored as a pending annotation so a regular tip on the same
-                # (block, start, end) range takes priority (Bug 2 fix).
+                # ── glottal onset check ────────────────────────────────────
                 glottal_annotation = None
                 phrase_opener = (i == 0)
                 if not phrase_opener and i > 0:
                     before = line_text[matches[i-1].end():m.start()]
                     phrase_opener = bool(re.search(r'[,;:.!?]', before))
                 if phrase_opener and 'glottal' in self._enabled_hint_types:
-                    # Only flag if the word starts with a vowel
                     prons_check = self._cached_pronunciations(word)
-                    preferred_c = self._preferred_index(word_l, block.position() + m.start())
+                    preferred_c = self._preferred_index(word_l, abs_s)
                     pron_check = prons_check[min(preferred_c, len(prons_check)-1)] if prons_check else ''
                     if pron_check and ipa_leading_vowel(pron_check) is not None:
+                        if song_style == 'mt_ccm':
+                            glottal_text = ('Phrase-initial vowel — in contemporary MT, glottal '
+                                            'and cry onsets are legitimate expressive tools '
+                                            '(think conversational attack). Decide per phrase: '
+                                            'clean balanced onset for lyric moments, a light '
+                                            'glottal or cry onset where the acting wants a spoken '
+                                            'edge. Just never let it become an unintentional habit.')
+                        else:
+                            glottal_text = ('Phrase-initial vowel \u2014 if you intend a glottal '
+                                            'attack here for dramatic effect, that is a valid choice. '
+                                            'If not, use a clean balanced onset (appoggio): '
+                                            'let the breath flow a split-second before the tone '
+                                            'to avoid an unintentional glottal strike.')
                         glottal_annotation = WordAnnotation(
                             word=word, word_lower=word_l,
                             block=block_num, start=m.start(), end=m.end(),
-                            abs_start=block.position() + m.start(),
+                            abs_start=abs_s,
                             abs_end=block.position() + m.end(),
                             tip_type='glottal',
-                            tip_text=('Phrase-initial vowel \u2014 if you intend a glottal attack here '
-                                      'for dramatic effect, that is a valid choice. '
-                                      'If not, use a clean balanced onset (appoggio): '
-                                      'let the breath flow a split-second before the tone '
-                                      'to avoid an unintentional glottal strike.'),
+                            tip_text=glottal_text,
                             color=ANN_COLOR['glottal'],
                             bg_color=ANN_BG['glottal'],
                         )
 
-                # ── next-word context ─────────────────────────────────────
+                # ── next-word context ──────────────────────────────────────
                 next_ipa = None
                 has_punct_boundary = False
                 if i + 1 < len(matches):
@@ -4881,26 +5202,23 @@ class MainWindow(QMainWindow):
                     word, None if has_punct_boundary else next_ipa)
                 if not prons:
                     continue
-                preferred = self._preferred_index(word_l, block.position() + m.start())
+                preferred = self._preferred_index(word_l, abs_s)
                 pron = prons[min(preferred, len(prons) - 1)]
-                # ── classify — single source of truth, shared with the word
-                #    detail panel and cheat-sheet export so all three agree
                 tips = compute_word_tips(
                     pron, next_ipa, has_punct_boundary,
-                    song_style, self._enabled_hint_types)
+                    song_style, self._enabled_hint_types,
+                    is_emphatic=is_emphatic)
 
                 if not tips:
-                    # No regular tip — emit the pending glottal onset note if any
                     if glottal_annotation:
                         annotations.append(glottal_annotation)
                     continue
 
-                # Regular tip(s) fire on this range — skip glottal to avoid overlap
                 for tt, txt in tips:
                     annotations.append(WordAnnotation(
                         word=word, word_lower=word_l,
                         block=block_num, start=m.start(), end=m.end(),
-                        abs_start=block.position() + m.start(),
+                        abs_start=abs_s,
                         abs_end=block.position() + m.end(),
                         tip_type=tt, tip_text=txt,
                         color=ANN_COLOR[tt],
@@ -4926,6 +5244,232 @@ class MainWindow(QMainWindow):
                 word_lower in self.active_song.sustained_words,
                 self.analysis._current_vowel)
 
+    def _build_tension_watchlist(self) -> list:
+        """Return [(word, where, risk_text)] for emphatic occurrences with tension heuristics."""
+        song = self.active_song
+        if not song.lyrics:
+            return []
+        entries = []
+        occ_list = word_occurrences(song.lyrics)
+        cumul = [0]
+        for ln in song.lyrics.splitlines():
+            cumul.append(cumul[-1] + len(ln) + 1)
+
+        for wm, wkey in occ_list:
+            w   = wm.group()
+            wl  = w.lower()
+            is_sustained = wl in song.sustained_words
+            is_high      = wkey in song.high_marks
+            if not (is_sustained or is_high):
+                continue
+            tier = song.high_marks.get(wkey, '')
+            prons = self._cached_pronunciations(w)
+            if not prons:
+                continue
+            idx  = self._preferred_index(wl, wm.start())
+            pron = prons[min(idx, len(prons) - 1)]
+            syls = find_syllable_vowels(pron)
+            trailing = ipa_trailing_consonants(pron)
+            bn   = next((i for i in range(len(cumul)-1, -1, -1)
+                         if cumul[i] <= wm.start()), 0)
+            where = f'line {bn + 1}'
+
+            # Heuristic 1: close vowel at climax/high
+            if tier in ('high', 'climax'):
+                primary = syls[0][0] if syls else ''
+                for sym, stress, _ in syls:
+                    if stress:
+                        primary = sym
+                        break
+                if primary in ('i', 'y', 'u'):
+                    entries.append((w, where,
+                        'Close vowel at height — risk of squeeze. Keep pharyngeal '
+                        'space; think tall, not tight; allow the legit modification '
+                        '(ɪ/ʊ) or, contemporary, narrow without pressing.'))
+
+            # Heuristic 2: /æ/ in any syllable
+            if any(s == 'æ' for s, _, _ in syls):
+                entries.append((w, where,
+                    '/æ/ under load — jaw and lip-corner tension trap. '
+                    'Release the jaw hinge; brightness comes from resonance, '
+                    'not spreading.'))
+
+            # Heuristic 3: trailing /l/
+            if trailing and trailing[-1] == 'l':
+                entries.append((w, where,
+                    'Final /l/ on a held word — tongue-root pull-back darkens and '
+                    'tightens. Tip stays at the ridge; root stays released.'))
+
+            # Heuristic 4: rhotic
+            rhotics = [c for c in trailing if c in IPA_RHOTIC]
+            has_rhv  = any(s in ('ɚ', 'ɝ') for s, _, _ in syls)
+            if rhotics or has_rhv:
+                entries.append((w, where,
+                    'R on a held note — curl/bunch tension. Release the r-posture '
+                    'during the sustain; re-form it only at the release.'))
+
+            # Heuristic 5: consonant cluster into high/climax
+            if tier in ('high', 'climax'):
+                lead = []
+                for ch in pron:
+                    v = ipa_leading_vowel(pron[pron.index(ch):]) if ch in pron else None
+                    break
+                # walk frontal consonants
+                pos = 0
+                while pos < len(pron):
+                    seg2 = pron[pos:pos+2]
+                    seg1 = pron[pos:pos+1]
+                    if seg2 in IPA_PLOSIVES or seg2 in IPA_FRICATIVES:
+                        lead.append(seg2); pos += 2
+                    elif seg1 in IPA_PLOSIVES or seg1 in IPA_FRICATIVES or seg1 in IPA_NASALS:
+                        lead.append(seg1); pos += 1
+                    else:
+                        break
+                if len(lead) >= 2:
+                    entries.append((w, where,
+                        "Consonant cluster into a big note — don't let the "
+                        "consonants steal the breath or set the throat. "
+                        "Articulate them early and light; the vowel owns the beat."))
+        return entries
+
+    def _on_show_tension_watchlist(self):
+        lst = self._build_tension_watchlist()
+        if not lst:
+            QMessageBox.information(
+                self, 'Tension Watchlist',
+                'No emphatic words yet. Mark sustained notes, high notes, or '
+                'climaxes first — the watchlist is built from words you actually hold.')
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Tension Watchlist')
+        dlg.setMinimumSize(_scale(560), _scale(420))
+        lay = QVBoxLayout(dlg)
+        te = QPlainTextEdit()
+        te.setReadOnly(True)
+        lines = []
+        for tw, twhere, trisk in lst:
+            lines.append(f'{tw}  ({twhere})')
+            lines.append(f'    {trisk}')
+            lines.append('')
+        te.setPlainText('\n'.join(lines))
+        lay.addWidget(te)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok)
+        bb.accepted.connect(dlg.accept)
+        lay.addWidget(bb)
+        dlg.exec_()
+
+    def _update_phrase_budget(self):
+        """Compute phrase-syllable budget for the currently selected word and show."""
+        if not hasattr(self, 'phrase_budget_label'):
+            return
+        song = self.active_song
+        occ_key = self._current_clicked_occ_key
+        if occ_key is None:
+            self.phrase_budget_label.setVisible(False)
+            return
+
+        text = self.editor.toPlainText()
+        occ_list = word_occurrences(text)  # list of (match, key)
+
+        if not song.breath_marks:
+            # Gentle nudge only when non-trivial and a word is selected
+            if len(occ_list) >= 12:
+                self.phrase_budget_label.setText(
+                    'No breath marks yet — right-click a word → "Breath after…" '
+                    'to plan your phrases. Budget feedback appears once marks exist.')
+                self.phrase_budget_label.setVisible(True)
+            else:
+                self.phrase_budget_label.setVisible(False)
+            return
+
+        # Partition into phrases at breath marks and stanza breaks
+        phrases = []   # each phrase: list of (match, key)
+        cur: list = []
+        prev_end = 0
+        for wm, wkey in occ_list:
+            # Stanza break: two newlines between previous word end and this start
+            gap = text[prev_end:wm.start()]
+            if '\n\n' in gap and cur:
+                phrases.append(cur)
+                cur = []
+            cur.append((wm, wkey))
+            prev_end = wm.end()
+            if wkey in song.breath_marks:
+                phrases.append(cur)
+                cur = []
+        if cur:
+            phrases.append(cur)
+
+        # Find the phrase containing occ_key
+        target_phrase = None
+        for ph in phrases:
+            for _, k in ph:
+                if k == occ_key:
+                    target_phrase = ph
+                    break
+            if target_phrase is not None:
+                break
+
+        if target_phrase is None:
+            self.phrase_budget_label.setVisible(False)
+            return
+
+        # Syllable cost
+        syll = 0
+        for wm, wkey in target_phrase:
+            w = wm.group()
+            prons = self._context_aware_pronunciations(w, None)
+            if prons:
+                idx = self._preferred_index(w.lower(), wm.start())
+                pron = prons[min(idx, len(prons) - 1)]
+                syll += len(find_syllable_vowels(pron)) or 1
+            else:
+                syll += 1
+
+        start_word = target_phrase[0][0].group()
+        end_word   = target_phrase[-1][0].group()
+        msg = f'Phrase budget: {syll} syllable{"s" if syll != 1 else ""} from "{start_word}" to "{end_word}".'
+
+        if syll >= 16:
+            msg += (' Long phrase — if it runs out, steal a catch-breath (\') at '
+                    'a function word or after sentence punctuation.')
+
+        last_key = target_phrase[-1][1]
+        last_word_l = target_phrase[-1][0].group().lower()
+        last_emphatic = (last_word_l in song.sustained_words or
+                         last_key in song.high_marks)
+        if last_emphatic and syll >= 10:
+            msg += (" It ends on a marked note — bank air early; don't arrive at "
+                    "the sustain on fumes.")
+
+        self.phrase_budget_label.setText(msg)
+        self.phrase_budget_label.setVisible(True)
+
+    def _on_word_high_mark_set(self, word_lower: str, bn: int, co: int, tier: str):
+        key = self._occ_key(word_lower, self._abs_offset(bn, co))
+        if key is None:
+            return
+        if tier:
+            self.active_song.high_marks[key] = tier
+        else:
+            self.active_song.high_marks.pop(key, None)
+        self._schedule_save()
+        self._refresh_mark_overlays()
+        if self.analysis.word_label.text() == word_lower:
+            self._on_word_clicked(word_lower, bn, co)
+
+    def _on_word_breath_mark_set(self, word_lower: str, bn: int, co: int, kind: str):
+        key = self._occ_key(word_lower, self._abs_offset(bn, co))
+        if key is None:
+            return
+        if kind:
+            self.active_song.breath_marks[key] = kind
+        else:
+            self.active_song.breath_marks.pop(key, None)
+        self._schedule_save()
+        self._refresh_mark_overlays()
+        self._update_phrase_budget()
+
     def _on_word_clicked(self, word, block_number, char_offset=-1):
         self._current_block_number = block_number
         line = self.editor.line_text(block_number)
@@ -4935,14 +5479,19 @@ class MainWindow(QMainWindow):
         next_ipa = self._get_next_word_ipa(line, word, char_offset)
         prons = self._context_aware_pronunciations(word, next_ipa)
         preferred = self._preferred_index(word.lower(), abs_start)
+        is_emphatic = (word.lower() in self.active_song.sustained_words or
+                       (self._current_clicked_occ_key or '') in self.active_song.high_marks)
+        high_tier = self.active_song.high_marks.get(self._current_clicked_occ_key or '', '')
         self.analysis.show_word(
             word, prons, initial_index=preferred, next_ipa=next_ipa,
             song_style=getattr(self.active_song, 'style', 'classical'),
-            enabled_hints=self._enabled_hint_types)
+            enabled_hints=self._enabled_hint_types,
+            is_emphatic=is_emphatic, high_tier=high_tier)
         self.analysis._show_sustained_tips(
             word.lower() in self.active_song.sustained_words,
             self.analysis._current_vowel)
         self._update_trajectory(line, char_offset)
+        self._update_phrase_budget()
 
     def _cached_pronunciations(self, word):
         cache_key = word.lower()
@@ -5120,7 +5669,7 @@ class MainWindow(QMainWindow):
                 running += 1
         self.trajectory.set_highlight(target)
 
-    def _resolve_audio(self, sym):
+    def _resolve_audio(self, sym, subdir: str = ''):
         """Return the audio file path for *sym*, or None if none exists."""
         candidates = [sym]
         if sym in DIPHTHONGS:
@@ -5131,19 +5680,23 @@ class MainWindow(QMainWindow):
         elif sym == 'ɚ':
             candidates.append('ə')
         for c in candidates:
-            audio = self._resource_path(path.join('Audio', f'{c}.mp3'))
+            audio = self._resource_path(path.join('Audio', subdir, f'{c}.mp3'))
             if path.exists(audio):
                 return audio
-        if sym not in self._missing_audio_warned:
-            self._missing_audio_warned.add(sym)
-            print(f'Audio: no file found for /{sym}/ (tried: '
-                  f'{[path.join("Audio", f"{c}.mp3") for c in candidates]})',
-                  file=sys.stderr)
+        if not subdir:
+            if sym not in self._missing_audio_warned:
+                self._missing_audio_warned.add(sym)
+                print(f'Audio: no file found for /{sym}/ (tried: '
+                      f'{[path.join("Audio", f"{c}.mp3") for c in candidates]})',
+                      file=sys.stderr)
         return None
 
     def _play_vowel(self, sym):
         # A single vowel play cancels any sequence currently in progress.
         self._vowel_seq_active = False
+        self._seq_vowel_done = True
+        self._seq_gap.stop()
+        self._seq_hold.stop()
         audio = self._resolve_audio(sym)
         if audio:
             self.player.setMedia(QMediaContent(QUrl.fromLocalFile(audio)))
@@ -5173,31 +5726,58 @@ class MainWindow(QMainWindow):
             return
         sym = self._vowel_seq[self._vowel_seq_idx]
         self.trajectory.set_highlight(self._vowel_seq_idx)
-        audio = self._resolve_audio(sym)
+        rate = self._seq_rate
+        audio = None
+        if self._seq_variant:
+            audio = self._resolve_audio(sym, self._seq_variant)
+            if audio:
+                rate = 1.0   # variant is pre-stretched, pitch-preserved
+        if audio is None:
+            audio = self._resolve_audio(sym)
         if audio:
+            self._seq_vowel_done = False
+            self.player.setPlaybackRate(rate)
             self.player.setMedia(QMediaContent(QUrl.fromLocalFile(audio)))
             self.player.play()
-            self._seq_hold.start()   # cap this vowel's sounding duration
+            # Watchdog only — generous, since clips now play in full.
+            self._seq_hold.start(6000)
         else:
             # No audio for this vowel — skip straight to the next one.
             self._advance_vowel_seq()
 
     def _advance_vowel_seq(self):
+        if not self._vowel_seq_active:
+            return
         self._vowel_seq_idx += 1
         self._play_seq_current()
 
-    def _on_seq_hold_elapsed(self):
-        """Hold-cap timer fired — stop the clip and move to the next vowel."""
-        if not self._vowel_seq_active:
+    def _finish_current_vowel(self):
+        """Sole exit path for the current vowel (EndOfMedia, InvalidMedia,
+        or watchdog).  Idempotent via _seq_vowel_done so near-simultaneous
+        signals can't double-advance."""
+        if not self._vowel_seq_active or self._seq_vowel_done:
             return
+        self._seq_vowel_done = True
+        self._seq_hold.stop()
         self.player.stop()
-        self._advance_vowel_seq()
+        if self._seq_gap_ms > 0:
+            self._seq_gap.start(self._seq_gap_ms)
+        else:
+            self._advance_vowel_seq()
+
+    def _on_seq_hold_elapsed(self):
+        """Watchdog fired — playback never produced (enough) audio.
+        Abandon this vowel and keep the sequence moving."""
+        self._finish_current_vowel()
 
     def _on_media_status(self, status):
-        """Clip ended before the hold cap — cancel the cap and advance early."""
-        if status == QMediaPlayer.EndOfMedia and self._vowel_seq_active:
-            self._seq_hold.stop()
-            self._advance_vowel_seq()
+        """EndOfMedia: clip shorter than the cap — finish early.
+        InvalidMedia: unreadable file — finish so the sequence
+        doesn't wait on the watchdog."""
+        if not self._vowel_seq_active:
+            return
+        if status in (QMediaPlayer.EndOfMedia, QMediaPlayer.InvalidMedia):
+            self._finish_current_vowel()
 
     @staticmethod
     def _resource_path(relative):
@@ -5340,9 +5920,9 @@ class MainWindow(QMainWindow):
 
         raw_style = getattr(self.active_song, 'style', 'classical')
         if raw_style == 'mt_ccm':
-            style_phrase = 'musical theatre / CCM / pop'
+            style_phrase = 'contemporary musical theatre / pop'
         else:
-            style_phrase = 'classical / legit'
+            style_phrase = 'legit / classical musical theatre'
 
         title_line = f'"{name}"' + (f' {title_note}' if title_note else '')
 
@@ -5363,6 +5943,46 @@ class MainWindow(QMainWindow):
                 "Words I am holding as sustained notes (long tones — your singing "
                 "and phrasing notes should give these particular attention): "
                 f"{', '.join(sustained)}.")
+
+        # High marks context
+        if song.high_marks:
+            occ_list = word_occurrences(self.editor.toPlainText())
+            counts_map: dict = {}
+            for wm, wkey in occ_list:
+                wl = wm.group().lower()
+                counts_map[wl] = counts_map.get(wl, 0) + 1
+            def _occ_readable(key):
+                base, _, n = key.partition('#')
+                if not n:
+                    return base
+                total = counts_map.get(base, 1)
+                if total <= 1:
+                    return base
+                ordinals = ['1st','2nd','3rd','4th','5th','6th','7th','8th']
+                ni = int(n)
+                ord_s = ordinals[ni] if ni < len(ordinals) else f'{ni+1}th'
+                return f'{base} ({ord_s} occurrence)'
+            highs = [_occ_readable(k) for k, v in song.high_marks.items() if v == 'high']
+            climaxes = [_occ_readable(k) for k, v in song.high_marks.items() if v == 'climax']
+            parts_hm = []
+            if highs:
+                parts_hm.append(f'high — {", ".join(highs)}')
+            if climaxes:
+                parts_hm.append(f'climax — {", ".join(climaxes)}')
+            if parts_hm:
+                context_bits.append(
+                    'Notes I have marked as high or climactic (the music peaks here — '
+                    f'direction must serve these): {"; ".join(parts_hm)}.')
+
+        # Breath plan context
+        if song.breath_marks:
+            occ_map_bp = {wm.start(): wkey for wm, wkey in word_occurrences(self.editor.toPlainText())}
+            marked_lyrics = self._lyrics_with_breath_glyphs(
+                self.editor.toPlainText(), song.breath_marks, song.high_marks, occ_map_bp)
+            context_bits.append(
+                "My current breath plan, shown as the lyrics with ✓ (full breath) "
+                "and ' (catch-breath) inserted where I breathe:\n" + marked_lyrics)
+
         diction_context = ('\n\n' + '\n\n'.join(context_bits)) if context_bits else ''
 
         # Step B varies depending on whether I named my role.
@@ -5410,7 +6030,7 @@ class MainWindow(QMainWindow):
             f"{step_b}"
             f"With those resolved, respond in plain prose under the numbered "
             f"section headers below. No JSON, no code fences, no markdown tables "
-            f"in sections 1–8. "
+            f"in sections 1–9. "
             f"Cite recordings as performer + year + medium (cast album, film, "
             f"broadcast), and only cite ones you are confident are real. If a "
             f"section does not apply, say so briefly rather than padding.\n\n"
@@ -5479,7 +6099,19 @@ class MainWindow(QMainWindow):
             f"misplaced emphases, vowel traps, clichéd dramatic choices. For each, "
             f"name the word or line, say why the mistake happens, and what to do "
             f"instead.\n\n"
-            f"After the eight prose sections, output exactly one import block — "
+            f"9. Breath, Support, and Body\n"
+            f"Working from my breath plan above (or proposing one if I have none), "
+            f"give phrase-by-phrase breath strategy: where the full breaths and "
+            f"catch-breaths belong, which phrases are the air-budget risks, and "
+            f"how to pace support across each long phrase so the marked high notes "
+            f"and climaxes arrive funded rather than squeezed. Flag any of my "
+            f"breath placements that fight the musical line. Add body-level "
+            f"reminders only where they attach to a specific word or phrase — "
+            f"jaw release, tongue-root release, neck/shoulder reset before a "
+            f"climax — not generic relaxation advice. The same verification rule "
+            f"applies: tie claims to the score or recordings where you can, and "
+            f"mark inferences as conditional.\n\n"
+            f"After the nine prose sections, output exactly one import block — "
             f"this only, nothing after it:\n"
             f"NOTES-FOR-IMPORT\n"
             f"<<<\n"
@@ -5492,7 +6124,7 @@ class MainWindow(QMainWindow):
             f"the shortest unambiguous span; extend with a neighbouring word if "
             f"the span repeats elsewhere. note is one actionable direction under "
             f"~15 words (e.g. 'go loud', 'darken the vowel', 'spit the "
-            f"consonant'). Draw 5\u201320 notes from sections 4 and 5 only. "
+            f"consonant'). Draw 5\u201320 notes from sections 4, 5, and 9 only. "
             f"This JSON block is the only place JSON is allowed in your response."
         )
 
@@ -5500,7 +6132,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, 'Direction Prompt Copied',
             "A research and direction prompt has been copied to your clipboard.\n\n"
-            "Paste it into an AI assistant. After the eight prose sections the "
+            "Paste it into an AI assistant. After the nine prose sections the "
             "response will contain a NOTES-FOR-IMPORT block that you can bring "
             "in via Song \u2192 Import Coaching Notes\u2026")
 
@@ -5617,6 +6249,61 @@ class MainWindow(QMainWindow):
         from PyQt5.QtGui import QDesktopServices
         QDesktopServices.openUrl(QUrl.fromLocalFile(path_))
 
+    def _on_change_save_folder(self):
+        """Let the user relocate songs.json with optional copy of existing data."""
+        import shutil
+        old_dir = self.store.dir
+
+        new_dir = QFileDialog.getExistingDirectory(
+            self, 'Choose Save Folder', old_dir)
+        if not new_dir or os.path.normpath(new_dir) == os.path.normpath(old_dir):
+            return
+
+        # Flush current state before touching files
+        self.active_song.lyrics = self.editor.toPlainText()
+        self._persist_songs()
+
+        old_json = os.path.join(old_dir, 'songs.json')
+        old_bak  = os.path.join(old_dir, 'songs.bak.json')
+        new_json = os.path.join(new_dir, 'songs.json')
+
+        if os.path.exists(old_json):
+            ans = QMessageBox.question(
+                self, 'Copy Songs?',
+                f'Copy your existing songs to the new folder?\n\n'
+                f'From: {old_dir}\nTo:   {new_dir}',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if ans == QMessageBox.Yes:
+                # Warn if destination already has a songs.json
+                if os.path.exists(new_json):
+                    confirm = QMessageBox.question(
+                        self, 'Overwrite Existing File?',
+                        f'The destination already contains a songs.json.\n'
+                        f'Overwrite it with your current songs?',
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                    if confirm != QMessageBox.Yes:
+                        return
+                try:
+                    shutil.copy2(old_json, new_json)
+                    if os.path.exists(old_bak):
+                        shutil.copy2(old_bak, os.path.join(new_dir, 'songs.bak.json'))
+                except OSError as exc:
+                    QMessageBox.warning(
+                        self, 'Copy Failed',
+                        f'Could not copy songs to the new folder:\n{exc}\n\n'
+                        f'The save folder has not been changed.')
+                    return  # abort — never point at a folder missing the data
+
+        # All good — update store and persist the new path
+        self.store.dir  = new_dir
+        self.store.path = os.path.join(new_dir, 'songs.json')
+        self.settings.setValue('saveDir', new_dir)
+        self.songs, self.active_index = self.store.load()
+        self._load_active_song()
+        QMessageBox.information(
+            self, 'Save Folder Changed',
+            f'Songs will now be saved to:\n{new_dir}')
+
     def _restore_state(self):
         geo = self.settings.value('geometry')
         if geo:
@@ -5627,7 +6314,6 @@ class MainWindow(QMainWindow):
         # Persist editor font size
         self._editor_font_size = int(
             self.settings.value('editorFontSize', self._editor_font_size))
-        self._apply_editor_font()
         # Persist UI scale — new key 'uiScale'; fall back to old 'uiFontScale'
         # if the user has an existing settings file from before this fix.
         if self.settings.contains('uiScale'):
@@ -5644,10 +6330,15 @@ class MainWindow(QMainWindow):
         # Persist enabled hint types
         saved_hints = self.settings.value('enabledHintTypes', None)
         if saved_hints is not None:
-            # QSettings stores lists as QVariant; normalise to set of str
+            # QSettings stores lists as QVariant; normalise to list of str
             if isinstance(saved_hints, str):
                 saved_hints = [saved_hints]
-            self._enabled_hint_types = set(saved_hints)
+            # '__none__' is written when the set was empty (Windows QSettings
+            # round-trips an empty list as None, losing the "all disabled" state)
+            if saved_hints == ['__none__']:
+                self._enabled_hint_types = set()
+            else:
+                self._enabled_hint_types = set(saved_hints)
             # Sync menu checkmarks
             if hasattr(self, '_hints_menu'):
                 for act in self._hints_menu.actions():
@@ -5657,6 +6348,14 @@ class MainWindow(QMainWindow):
                         if key:
                             act.setChecked(key in self._enabled_hint_types)
         self._update_hints_btn_label()
+        # Persist master hints toggle
+        saved_hints_enabled = self.settings.value('hintsEnabled', None)
+        if saved_hints_enabled is not None:
+            enabled = saved_hints_enabled in (True, 'true', 'True', 1, '1')
+            self._annotations_enabled = enabled
+            if hasattr(self, '_act_hints_enabled'):
+                self._act_hints_enabled.setChecked(enabled)
+            self._update_hints_btn_label()
         # Persist hint-highlight opacity
         saved_opacity = self.settings.value('hintOpacity', None)
         if saved_opacity is not None:
@@ -5670,22 +6369,32 @@ class MainWindow(QMainWindow):
             self._ipa_hints_enabled = saved_ipa_hints in (True, 'true', 'True', 1, '1')
         if hasattr(self, '_ipa_hints_action'):
             self._ipa_hints_action.setChecked(self._ipa_hints_enabled)
-        # Persist Play-line-vowels hold speed
-        saved_hold = self.settings.value('seqHoldMs', None)
-        if saved_hold is not None:
-            self._seq_hold_ms = int(saved_hold)
-            self._seq_hold.setInterval(self._seq_hold_ms)
-            # Sync combo to the nearest preset by hold_ms
-            best_idx = 0
-            best_diff = abs(self._seq_hold_ms - self._SEQ_SPEED_PRESETS[0][1])
-            for i, (_, ms) in enumerate(self._SEQ_SPEED_PRESETS):
-                diff = abs(self._seq_hold_ms - ms)
-                if diff < best_diff:
-                    best_diff, best_idx = diff, i
-            self._seq_speed_combo.blockSignals(True)
-            self._seq_speed_combo.setCurrentIndex(best_idx)
-            self._seq_speed_combo.blockSignals(False)
-        # (Any legacy speed setting from prior versions is silently ignored.)
+        # Restore Play-line-vowels gap; legacy 'seqHoldMs' (cap-based
+        # presets from prior versions) is deliberately ignored.
+        saved_label = self.settings.value('seqPresetLabel', None)
+        # Backward-compat: old saves used seqGapMs; derive a label from it.
+        if saved_label is None:
+            saved_gap = self.settings.value('seqGapMs', None)
+            if saved_gap is not None:
+                try:
+                    g = int(saved_gap)
+                except (TypeError, ValueError):
+                    g = None
+                if g is not None:
+                    for label, gap, _rate, _variant in self._SEQ_SPEED_PRESETS:
+                        if int(gap) == g:
+                            saved_label = label
+                            break
+        if saved_label is not None:
+            for i, (label, gap, rate, variant) in enumerate(self._SEQ_SPEED_PRESETS):
+                if label == saved_label:
+                    self._seq_gap_ms = int(gap)
+                    self._seq_rate = float(rate)
+                    self._seq_variant = variant
+                    self._seq_speed_combo.blockSignals(True)
+                    self._seq_speed_combo.setCurrentIndex(i)
+                    self._seq_speed_combo.blockSignals(False)
+                    break
 
 
     def _line_to_ipa_words(self, line_text: str,
@@ -5772,55 +6481,129 @@ class MainWindow(QMainWindow):
             line_base += len(raw_line) + 1  # +1 for the newline separator
         return blocks
 
+    def _lyrics_with_breath_glyphs(self, lyrics: str,
+                                    breath_marks: dict, high_marks: dict,
+                                    occ_map: dict) -> str:
+        """Return lyrics text with ✓/' breath glyphs and ▲/▲▲ high glyphs spliced in.
+
+        occ_map: abs_start → occurrence_key (pre-built by caller).
+        """
+        if not breath_marks and not high_marks:
+            return lyrics
+        parts = []
+        prev = 0
+        for m in WORD_RE.finditer(lyrics):
+            key = occ_map.get(m.start(), '')
+            # prefix high marker before word (no space)
+            prefix = ''
+            if key in high_marks:
+                tier_ = high_marks[key]
+                prefix = '▲▲' if tier_ == 'climax' else '▲'
+            parts.append(lyrics[prev:m.start()] + prefix + m.group())
+            prev = m.end()
+            # suffix breath marker after word
+            if key in breath_marks:
+                bkind_ = breath_marks[key]
+                parts.append(' ✓' if bkind_ == 'full' else " '")
+        parts.append(lyrics[prev:])
+        return ''.join(parts)
+
     def _build_cheat_sheet_data(self) -> dict:
         """Build structured cheat sheet data shared by all export formats.
 
         Returns a dict with:
           - title (str)
           - style (str)
-          - lyric_blocks: list of (text_line, ipa_line) tuples. Blank lines
-            in the source lyrics become ('', '') so spacing is preserved.
-          - word_entries: list of (word, ipa, sustained_bool, [unique_tips])
-            tuples. Each word appears once; identical tip texts are deduped.
+          - lyric_blocks: list of (text_line, ipa_line) tuples with mark glyphs
+            spliced into the text line. Blank lines become ('', '').
+          - word_entries: list of (word, ipa, marks_str, [unique_tips])
+          - tension: list of (word, where, risk_text) from _build_tension_watchlist
         """
         song = self.active_song
+
+        # Build occ_map: abs_start → key, for glyph splicing
+        occ_map = {wm.start(): wkey for wm, wkey in word_occurrences(song.lyrics)}
 
         lyric_blocks = []
         line_base = 0
         for raw_line in song.lyrics.splitlines():
             if raw_line.strip():
-                lyric_blocks.append((raw_line, self._line_to_ipa(raw_line, line_base)))
+                marked_line = self._lyrics_with_breath_glyphs(
+                    raw_line,
+                    {k: v for k, v in song.breath_marks.items()
+                     if any(occ_map.get(wm.start()) == k
+                            for wm in WORD_RE.finditer(raw_line,
+                                                       pos=0))},
+                    {k: v for k, v in song.high_marks.items()
+                     if any(occ_map.get(wm.start() + line_base - 0) == k
+                            for wm in WORD_RE.finditer(raw_line))},
+                    {abs_s - line_base: wkey
+                     for abs_s, wkey in
+                     ((wm.start(), wkey)
+                      for wm, wkey in word_occurrences(song.lyrics)
+                      if line_base <= wm.start() < line_base + len(raw_line) + 1)},
+                )
+                lyric_blocks.append((marked_line, self._line_to_ipa(raw_line, line_base)))
             else:
                 lyric_blocks.append(('', ''))
-            line_base += len(raw_line) + 1  # +1 for the newline separator
+            line_base += len(raw_line) + 1
+
+        # Build word_entries (per-occurrence pronunciation, marks string)
+        from collections import OrderedDict
+        word_occ: OrderedDict = OrderedDict()
+        for wm in WORD_RE.finditer(song.lyrics):
+            w   = wm.group()
+            wl  = w.lower()
+            abs_start = wm.start()
+            key = occ_map.get(abs_start, '')
+            prons = self._context_aware_pronunciations(w, None)
+            if wl not in word_occ:
+                word_occ[wl] = {'word': w, 'prons_seen': [], 'prons_order': [],
+                                'high_tier': ''}
+            if prons:
+                preferred = self._preferred_index(wl, abs_start)
+                used = prons[min(preferred, len(prons) - 1)]
+                if used not in word_occ[wl]['prons_seen']:
+                    word_occ[wl]['prons_seen'].append(used)
+                    word_occ[wl]['prons_order'].append(used)
+            # Track highest tier across occurrences
+            if key in song.high_marks:
+                t = song.high_marks[key]
+                if t == 'climax' or word_occ[wl]['high_tier'] == '':
+                    word_occ[wl]['high_tier'] = t
 
         word_entries = []
-        seen = set()
-        for m in WORD_RE.finditer(song.lyrics):
-            w = m.group()
-            wl = w.lower()
-            if wl in seen:
-                continue
-            seen.add(wl)
-            prons = self._context_aware_pronunciations(w, None)
-            preferred = self._pron_index_cache.get(wl, 0)
-            pron = prons[min(preferred, len(prons) - 1)] if prons else '?'
-            sustained = wl in song.sustained_words
-            # Deduplicate tip texts: identical annotations on multiple
-            # occurrences of the same word collapse to one entry.
-            tips_seen = set()
-            tips = []
+        for wl, info in word_occ.items():
+            w         = info['word']
+            prons_used = info['prons_order']
+            pron_cell  = ' · '.join(prons_used) if prons_used else '?'
+            if len(prons_used) == 1:
+                pron_cell = prons_used[0]
+            # Marks string: ⭐ sustained, ▲▲ climax, ▲ high
+            marks_parts = []
+            if wl in song.sustained_words:
+                marks_parts.append('⭐')
+            tier_ = info['high_tier']
+            if tier_ == 'climax':
+                marks_parts.append('▲▲')
+            elif tier_ == 'high':
+                marks_parts.append('▲')
+            marks_str = ''.join(marks_parts)
+            # Deduplicate tip texts
+            tips_seen: set = set()
+            tips: list = []
             for ann in self._word_annotations:
                 if ann.word_lower == wl and ann.tip_text not in tips_seen:
                     tips_seen.add(ann.tip_text)
                     tips.append(ann.tip_text)
-            word_entries.append((w, pron, sustained, tips))
+            word_entries.append((w, pron_cell, marks_str, tips))
 
         return {
             'title': song.name,
             'style': song.style,
             'lyric_blocks': lyric_blocks,
             'word_entries': word_entries,
+            'tension': self._build_tension_watchlist(),
         }
 
     def _build_cheat_sheet_lines(self) -> list:
@@ -5839,20 +6622,30 @@ class MainWindow(QMainWindow):
             else:
                 lines.append('')
 
-        # ── Word reference (unique words, deduplicated tips) ─────────────────
+        # ── Word reference ──────────────────────────────────────────────────
         lines.append('## Word Reference')
         lines.append('')
-        lines.append('| Word | IPA | Sustained | Notes |')
+        lines.append('| Word | IPA | Marks | Notes |')
         lines.append('|---|---|---|---|')
-        for w, pron, sustained, tips in data['word_entries']:
-            sustained_tag = '⭐' if sustained else ''
+        for w, pron, marks_str, tips in data['word_entries']:
             tip_cell = ' • '.join(tips) if tips else ''
-            # Pipe and newline characters would break the markdown table row
             tip_cell = tip_cell.replace('|', '\\|').replace('\n', ' ')
-            lines.append(f'| {w} | /{pron}/ | {sustained_tag} | {tip_cell} |')
+            lines.append(f'| {w} | /{pron}/ | {marks_str} | {tip_cell} |')
 
         lines.append('')
-        lines.append(f'*Style: {data["style"]}  |  Generated by Lyric IPA Finder*')
+
+        # ── Tension watchlist ────────────────────────────────────────────────
+        tension = data.get('tension', [])
+        if tension:
+            lines.append('## Tension Watchlist')
+            lines.append('')
+            for tw, twhere, trisk in tension:
+                lines.append(f'- **{tw}** ({twhere}) — {trisk}')
+            lines.append('')
+
+        lines.append(f'*Style: {data["style"]}  |  '
+                     f'⭐ = sustained · ▲ = high note · ▲▲ = climax · ✓/\' = breath marks  |  '
+                     f'Generated by Lyric IPA Finder*')
         return lines
 
     def _on_export_cheat_sheet(self, fmt: str):
@@ -5948,22 +6741,21 @@ class MainWindow(QMainWindow):
 
             story.append(Spacer(1, 6*mm))
 
-            # ── Word reference table (deduplicated tips) ────────────────────
+            # ── Word reference table ────────────────────────────────────────
             story.append(Paragraph('Word Reference', section_style))
             story.append(Spacer(1, 2*mm))
 
-            table_data = [['Word', 'IPA', '★', 'Notes']]
-            for w, pron, sustained, tips in data['word_entries']:
-                sustained_tag = '★' if sustained else ''
+            table_data = [['Word', 'IPA', 'Marks', 'Notes']]
+            for w, pron, marks_str, tips in data['word_entries']:
                 tip_str = ' • '.join(tips) if tips else ''
                 table_data.append([
                     Paragraph(html.escape(w), cell_word_style),
                     Paragraph(f'/{html.escape(pron)}/', cell_ipa_style),
-                    sustained_tag,
+                    html.escape(marks_str),
                     Paragraph(html.escape(tip_str), cell_style),
                 ])
 
-            col_widths = [28*mm, 38*mm, 7*mm, None]
+            col_widths = [28*mm, 38*mm, 12*mm, None]
             t = Table(table_data, colWidths=col_widths, repeatRows=1)
             t.setStyle(TableStyle([
                 ('BACKGROUND',     (0, 0), (-1, 0),  rlc.HexColor('#2c3a58')),
@@ -5983,8 +6775,21 @@ class MainWindow(QMainWindow):
             ]))
             story.append(t)
             story.append(Spacer(1, 4*mm))
+
+            # ── Tension watchlist ───────────────────────────────────────────
+            tension = data.get('tension', [])
+            if tension:
+                story.append(Paragraph('Tension Watchlist', section_style))
+                story.append(Spacer(1, 2*mm))
+                for tw, twhere, trisk in tension:
+                    story.append(Paragraph(
+                        f'<b>{html.escape(tw)}</b> ({html.escape(twhere)}) — '
+                        f'{html.escape(trisk)}', cell_style))
+                    story.append(Spacer(1, 2*mm))
+
             story.append(Paragraph(
-                f'Style: {data["style"]}  |  ★ = sustained note  |  '
+                f'Style: {data["style"]}  |  '
+                f'&#9733; = sustained  |  &#9650; = high  |  &#9650;&#9650; = climax  |  '
                 f'Generated by Lyric IPA Finder',
                 footer_style))
             doc.build(story)
@@ -6036,19 +6841,29 @@ class MainWindow(QMainWindow):
             parts.append('<h2>Word Reference</h2>')
             parts.append('<table>'
                          '<tr><th>Word</th><th>IPA</th>'
-                         '<th class="center">★</th><th>Notes</th></tr>')
-            for w, pron, sustained, tips in data['word_entries']:
-                sustained_tag = '★' if sustained else ''
+                         '<th class="center">Marks</th><th>Notes</th></tr>')
+            for w, pron, marks_str, tips in data['word_entries']:
                 tip_str = html.escape(' • '.join(tips)) if tips else ''
                 parts.append(
                     f'<tr><td class="word">{html.escape(w)}</td>'
                     f'<td class="ipacell">/{html.escape(pron)}/</td>'
-                    f'<td class="center">{sustained_tag}</td>'
+                    f'<td class="center">{html.escape(marks_str)}</td>'
                     f'<td>{tip_str}</td></tr>')
+            parts.append('</table>')
+
+            tension = data.get('tension', [])
+            if tension:
+                parts.append('<h2>Tension Watchlist</h2><ul>')
+                for tw, twhere, trisk in tension:
+                    parts.append(
+                        f'<li><b>{html.escape(tw)}</b> ({html.escape(twhere)}) — '
+                        f'{html.escape(trisk)}</li>')
+                parts.append('</ul>')
+
             parts += [
-                '</table>',
                 f'<p class="footer">Style: {html.escape(data["style"])} | '
-                f'★ = sustained note | Generated by Lyric IPA Finder</p>',
+                f'⭐ = sustained · ▲ = high · ▲▲ = climax · ✓/\' = breath | '
+                f'Generated by Lyric IPA Finder</p>',
                 '</body></html>',
             ]
             tdoc = QTextDocument()
@@ -6060,6 +6875,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._save_timer.stop()
         self._annotation_timer.stop()
+        self._seq_hold.stop()
+        self._seq_gap.stop()
+        self.player.stop()
+        self._seq_vowel_done = True
         self.active_song.lyrics = self.editor.toPlainText()
         self._persist_songs()
         self.settings.setValue('geometry', self.saveGeometry())
@@ -6068,7 +6887,11 @@ class MainWindow(QMainWindow):
         self.settings.setValue('uiScale', self._ui_scale)
         self.settings.setValue('hintOpacity', self._hint_opacity)
         self.settings.setValue('ipaHintsEnabled', self._ipa_hints_enabled)
-        self.settings.setValue('enabledHintTypes', list(self._enabled_hint_types))
+        # Persist type set with explicit sentinel so an empty set survives QSettings
+        # round-trip on Windows (empty list becomes None on read-back).
+        self.settings.setValue('enabledHintTypes',
+                               list(self._enabled_hint_types) or ['__none__'])
+        self.settings.setValue('hintsEnabled', self._annotations_enabled)
         super().closeEvent(event)
 
 
