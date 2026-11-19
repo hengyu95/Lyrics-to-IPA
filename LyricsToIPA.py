@@ -431,6 +431,26 @@ def _tts_cleanup() -> None:
 atexit.register(_tts_cleanup)
 
 
+# Spanish-only allophones an English SAPI voice can't render → nearest
+# English phone.  English IPA contains none of these symbols, so English
+# words pass through unchanged.  /ð/ is intentionally NOT mapped: English
+# already has it, so words like "vida" /ˈβiða/ keep their soft-d.
+_ANGLICIZE_MAP = {
+    'β': 'b',   # voiced bilabial fricative → b
+    'ɣ': 'g',   # voiced velar fricative → g
+    'ʝ': 'j',   # voiced palatal fricative ("ll"/"y") → j glide
+    'ɾ': 'ɹ',   # alveolar tap → English r approximant
+}
+
+
+def _anglicize_ipa(ipa: str) -> str:
+    """Fold Spanish-only allophones onto the nearest phone an English SAPI
+    voice can produce, so mixed EN/ES lyrics don't come out as nonsense."""
+    if not ipa:
+        return ipa
+    return ''.join(_ANGLICIZE_MAP.get(ch, ch) for ch in ipa)
+
+
 def _tts_speak(word: str, ipa_pron: str = '') -> None:
     """Speak *word* via system TTS, using *ipa_pron* where supported.
 
@@ -445,18 +465,29 @@ def _tts_speak(word: str, ipa_pron: str = '') -> None:
         if sys.platform == 'win32':
             safe_word = word.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             if ipa_pron:
-                # XML-escape the IPA string for the ph attribute
-                safe_ipa = (ipa_pron
-                            .replace('&', '&amp;')
-                            .replace('"', '&quot;')
-                            .replace('<', '&lt;')
-                            .replace('>', '&gt;'))
+                # Fold Spanish-only allophones onto the nearest phone the
+                # English SAPI voice can render (English IPA is unaffected).
+                ipa_pron = _anglicize_ipa(ipa_pron)
+                def _esc_ipa(s):
+                    return (s.replace('&', '&amp;')
+                             .replace('"', '&quot;')
+                             .replace('<', '&lt;')
+                             .replace('>', '&gt;'))
+                # SAPI rejects whitespace inside a ph attribute (multi-token IPA
+                # such as spelled acronyms like "gwb" -> /ˌdʒiː ˌdʌbəljuː ˈbiː/).
+                # Splitting into multiple <phoneme> elements leaves the empty-text
+                # ones SILENT in SAPI, so only the first token spoke. Collapse the
+                # tokens into ONE ph instead — the per-token stress marks (ˈ/ˌ)
+                # keep the syllable boundaries, so every letter/syllable sounds.
+                ph = _esc_ipa(''.join(ipa_pron.split()))
+                phonemes = (f'<phoneme alphabet="ipa" '
+                            f'ph="{ph}">{safe_word}</phoneme>')
                 ssml = (
                     '<?xml version="1.0" encoding="UTF-8"?>\n'
                     '<speak version="1.0" '
                     'xmlns="http://www.w3.org/2001/10/synthesis" '
                     'xml:lang="en-US">'
-                    f'<phoneme alphabet="ipa" ph="{safe_ipa}">{safe_word}</phoneme>'
+                    f'{phonemes}'
                     '</speak>'
                 )
             else:
@@ -1077,25 +1108,31 @@ def dedupe_pronunciations(items):
 
 def get_pronunciations(word: str, custom_ipa: Optional[dict] = None):
     word_l = word.lower()
-    if custom_ipa and word_l in custom_ipa:
-        # Strip surrounding slashes in case the user stored them (e.g. /valʒɑ̃/)
-        return [custom_ipa[word_l].strip('/').replace('ː', '')]
+    # Base readings from the function-word table or the pronouncing dictionary.
     if word_l in FUNCTION_WORDS:
-        return FUNCTION_WORDS[word_l].copy()
-
-    if word_l in _DICT_CACHE:
-        return _DICT_CACHE[word_l]
-    raw = ipa.convert(word_l, retrieve_all=True) or []
-    cleaned = [p.replace('ː', '') for p in raw if p and '*' not in p]
-
-    if not cleaned and ("'" in word_l or '\u2019' in word_l or '\u2018' in word_l):
-        stripped = word_l.replace("'", '').replace('\u2019', '').replace('\u2018', '')
-        raw = ipa.convert(stripped, retrieve_all=True) or []
+        base = FUNCTION_WORDS[word_l].copy()
+    elif word_l in _DICT_CACHE:
+        base = list(_DICT_CACHE[word_l])
+    else:
+        raw = ipa.convert(word_l, retrieve_all=True) or []
         cleaned = [p.replace('ː', '') for p in raw if p and '*' not in p]
 
-    result = dedupe_pronunciations(cleaned)
-    _DICT_CACHE[word_l] = result
-    return result
+        if not cleaned and ("'" in word_l or '\u2019' in word_l or '\u2018' in word_l):
+            stripped = word_l.replace("'", '').replace('\u2019', '').replace('\u2018', '')
+            raw = ipa.convert(stripped, retrieve_all=True) or []
+            cleaned = [p.replace('ː', '') for p in raw if p and '*' not in p]
+
+        base = dedupe_pronunciations(cleaned)
+        _DICT_CACHE[word_l] = base
+
+    # A custom IPA becomes the DEFAULT (index 0) but no longer erases the word's
+    # other readings — essential for bilingual homographs like "me" (Spanish
+    # /me/ vs English /mi/), where per-occurrence pron_choices then picks which
+    # reading each occurrence uses. Slashes/length marks stripped as before.
+    if custom_ipa and word_l in custom_ipa:
+        cust = custom_ipa[word_l].strip('/').replace('ː', '')
+        return dedupe_pronunciations([cust] + base)
+    return base
 
 
 def pronunciation_brightness(p: str) -> float:
@@ -4235,8 +4272,6 @@ class MainWindow(QMainWindow):
         self._vowel_seq_idx = 0
         self._vowel_seq_active = False
         self._seq_gap_ms: int = 0     # Normal preset: no gap between vowels
-        self._seq_rate: float = 1.0   # playback rate for current preset
-        self._seq_variant: str = ''   # Audio/ subfolder for current preset
         # Watchdog: recovers the sequence if a clip stalls and never ends.
         self._seq_hold = QTimer(self)
         self._seq_hold.setSingleShot(True)
@@ -4417,8 +4452,8 @@ class MainWindow(QMainWindow):
         self._seq_speed_combo.setToolTip(
             'Pause between vowels when playing the line in sequence.\n'
             'Each vowel sample always plays in full.')
-        for i, (label, _gap, _rate, _variant) in enumerate(self._SEQ_SPEED_PRESETS):
-            self._seq_speed_combo.addItem(label, i)
+        for label, ms in self._SEQ_SPEED_PRESETS:
+            self._seq_speed_combo.addItem(label, ms)
         self._seq_speed_combo.setCurrentIndex(0)  # default: Normal (no gap)
         self._seq_speed_combo.currentIndexChanged.connect(self._on_seq_speed_changed)
         th_layout.addWidget(self._seq_speed_label)
@@ -4485,6 +4520,10 @@ class MainWindow(QMainWindow):
         s.addAction(a)
         a = QAction('Generate &Direction Prompt to Clipboard', self)
         a.triggered.connect(self._on_generate_direction_prompt)
+        s.addAction(a)
+        a = QAction('Generate Coaching &Session Prompt to Clipboard', self)
+        a.triggered.connect(
+            lambda: self._on_generate_direction_prompt(interactive=True))
         s.addAction(a)
         a = QAction('&Import Coaching Notes…', self)
         a.triggered.connect(self._on_import_coaching_notes)
@@ -4961,26 +5000,19 @@ class MainWindow(QMainWindow):
 
     # ---- Sequential playback speed presets ----
 
-    # (label, gap_ms, rate, variant) — gap is the pause between vowels
-    # after each clip plays to its natural end.  variant names an Audio/
-    # subfolder of pre-rendered pitch-preserving clips to prefer; rate is
-    # the setPlaybackRate fallback used only when no variant file exists
-    # (resampled, so pitch rises).  Clips are never truncated.
+    # (label, gap_ms) — pause inserted between vowels after each clip
+    # plays to its natural end.  Clips are never truncated.
     _SEQ_SPEED_PRESETS = [
-        ('Fast',   0,   1.5, 'fast'),
-        ('Normal', 0,   1.0, ''),
-        ('Slow',   350, 1.0, ''),
+        ('Normal', 0),
+        ('Slow',   350),
     ]
 
     def _on_seq_speed_changed(self, index: int):
-        pi = self._seq_speed_combo.itemData(index)
-        if pi is None:
+        ms = self._seq_speed_combo.itemData(index)
+        if ms is None:
             return
-        label, gap, rate, variant = self._SEQ_SPEED_PRESETS[int(pi)]
-        self._seq_gap_ms = int(gap)
-        self._seq_rate = float(rate)
-        self._seq_variant = variant
-        self.settings.setValue('seqPresetLabel', label)
+        self._seq_gap_ms = int(ms)
+        self.settings.setValue('seqGapMs', self._seq_gap_ms)
 
     # ---- Inline annotation hints ----
 
@@ -5669,7 +5701,7 @@ class MainWindow(QMainWindow):
                 running += 1
         self.trajectory.set_highlight(target)
 
-    def _resolve_audio(self, sym, subdir: str = ''):
+    def _resolve_audio(self, sym):
         """Return the audio file path for *sym*, or None if none exists."""
         candidates = [sym]
         if sym in DIPHTHONGS:
@@ -5680,15 +5712,14 @@ class MainWindow(QMainWindow):
         elif sym == 'ɚ':
             candidates.append('ə')
         for c in candidates:
-            audio = self._resource_path(path.join('Audio', subdir, f'{c}.mp3'))
+            audio = self._resource_path(path.join('Audio', f'{c}.mp3'))
             if path.exists(audio):
                 return audio
-        if not subdir:
-            if sym not in self._missing_audio_warned:
-                self._missing_audio_warned.add(sym)
-                print(f'Audio: no file found for /{sym}/ (tried: '
-                      f'{[path.join("Audio", f"{c}.mp3") for c in candidates]})',
-                      file=sys.stderr)
+        if sym not in self._missing_audio_warned:
+            self._missing_audio_warned.add(sym)
+            print(f'Audio: no file found for /{sym}/ (tried: '
+                  f'{[path.join("Audio", f"{c}.mp3") for c in candidates]})',
+                  file=sys.stderr)
         return None
 
     def _play_vowel(self, sym):
@@ -5726,17 +5757,9 @@ class MainWindow(QMainWindow):
             return
         sym = self._vowel_seq[self._vowel_seq_idx]
         self.trajectory.set_highlight(self._vowel_seq_idx)
-        rate = self._seq_rate
-        audio = None
-        if self._seq_variant:
-            audio = self._resolve_audio(sym, self._seq_variant)
-            if audio:
-                rate = 1.0   # variant is pre-stretched, pitch-preserved
-        if audio is None:
-            audio = self._resolve_audio(sym)
+        audio = self._resolve_audio(sym)
         if audio:
             self._seq_vowel_done = False
-            self.player.setPlaybackRate(rate)
             self.player.setMedia(QMediaContent(QUrl.fromLocalFile(audio)))
             self.player.play()
             # Watchdog only — generous, since clips now play in full.
@@ -5888,7 +5911,12 @@ class MainWindow(QMainWindow):
             f'copied to your clipboard. Paste it to an AI, then use '
             f'Song → Bulk Import IPAs… with the returned JSON.')
 
-    def _on_generate_direction_prompt(self):
+    def _on_generate_direction_prompt(self, *_, interactive=False):
+        """Copy an acting prompt built on Shurtleff's twelve guideposts.
+
+        interactive=False: the AI writes the full coaching dialogues itself.
+        interactive=True: the AI runs a live session, asking one question at
+        a time so the singer finds their own answers."""
         lyrics = self.editor.toPlainText().strip()
         if not lyrics:
             QMessageBox.information(
@@ -5926,22 +5954,18 @@ class MainWindow(QMainWindow):
 
         title_line = f'"{name}"' + (f' {title_note}' if title_note else '')
 
-        # Fold in the work I have already done in this app so the singing and
-        # phrasing advice is grounded in my actual choices, not generic rules.
+        # Fold in the marks I have made in this app. Only the ones that bear on
+        # acting choices go in: sustained words and high/climax peaks are where
+        # discoveries, events and the highest stakes tend to land. Pronunciation
+        # overrides and the breath plan are left out on purpose.
         song = self.active_song
         present = song._present_words()
-        custom = {k: v for k, v in song.custom_ipa.items() if k in present}
         sustained = sorted(w for w in song.sustained_words if w in present)
         context_bits = []
-        if custom:
-            pairs = ', '.join(f'{w} = /{v}/' for w, v in sorted(custom.items()))
-            context_bits.append(
-                "Pronunciations I have already fixed for this song (treat these "
-                f"as given — do not re-transcribe them): {pairs}.")
         if sustained:
             context_bits.append(
-                "Words I am holding as sustained notes (long tones — your singing "
-                "and phrasing notes should give these particular attention): "
+                "Words I hold as long notes (something should be happening "
+                "to me on each of these): "
                 f"{', '.join(sustained)}.")
 
         # High marks context
@@ -5971,19 +5995,12 @@ class MainWindow(QMainWindow):
                 parts_hm.append(f'climax — {", ".join(climaxes)}')
             if parts_hm:
                 context_bits.append(
-                    'Notes I have marked as high or climactic (the music peaks here — '
-                    f'direction must serve these): {"; ".join(parts_hm)}.')
+                    'Where the music peaks, as I have marked it (likely places '
+                    'for an event, a discovery or the highest stakes, and the '
+                    'acting choice there must fuel the peak, never shrink it): '
+                    f'{"; ".join(parts_hm)}.')
 
-        # Breath plan context
-        if song.breath_marks:
-            occ_map_bp = {wm.start(): wkey for wm, wkey in word_occurrences(self.editor.toPlainText())}
-            marked_lyrics = self._lyrics_with_breath_glyphs(
-                self.editor.toPlainText(), song.breath_marks, song.high_marks, occ_map_bp)
-            context_bits.append(
-                "My current breath plan, shown as the lyrics with ✓ (full breath) "
-                "and ' (catch-breath) inserted where I breathe:\n" + marked_lyrics)
-
-        diction_context = ('\n\n' + '\n\n'.join(context_bits)) if context_bits else ''
+        marks_context = ('\n\n' + '\n\n'.join(context_bits)) if context_bits else ''
 
         # Step B varies depending on whether I named my role.
         if role:
@@ -5991,150 +6008,335 @@ class MainWindow(QMainWindow):
                 f"Step B — Character. I am singing: {role}. Confirm this against "
                 f"the score or libretto and attribute my lines accordingly. If "
                 f"the lyrics clearly do not fit that role, tell me before "
-                f"proceeding. All acting and singing direction below is for this "
-                f"role only.\n\n")
+                f"proceeding. Everything below is for this role only.\n\n")
         else:
             step_b = (
                 "Step B — Character identification. From the lines provided, "
                 "determine which single character I am most likely playing. State "
                 "that character's name and explain your reasoning in one sentence. "
-                "All acting and singing direction below must be for that character "
-                "only. If you cannot determine which character I am playing, say "
-                "so and ask before proceeding.\n\n")
+                "Everything below is for that character only. If you cannot "
+                "determine which character I am playing, say so and ask before "
+                "proceeding.\n\n")
 
-        prompt = (
-            f"You are a vocal coach, stage director, and music scholar. "
-            f"I am preparing to sing the song below and need research and "
-            f"performance direction. My broad singing discipline is "
-            f"{style_phrase}, but that is background only — ground your advice in "
-            f"the specific vocal tradition and casting conventions of this "
-            f"particular role and work.\n\n"
-            f"Accuracy matters more than completeness. Where you are not sure of "
-            f"a fact — the work's identity, a recording, a musical detail — say "
-            f"so plainly rather than inventing it, and use web search to verify "
-            f"where you can. I am still building my technical vocabulary, so "
-            f"briefly gloss any specialist term in plain language the first time "
-            f"you use it.\n\n"
+        intro_common = (
             f"Song title: {title_line}\n\n"
             f"Lyrics (verbatim, between the markers):\n"
             f"<lyrics>\n{lyrics}\n</lyrics>"
-            f"{diction_context}\n\n"
-            f"BEFORE YOU WRITE ANYTHING ELSE, do these two steps and state your "
-            f"findings at the top of your response:\n\n"
+            f"{marks_context}\n\n"
+        )
+
+        accuracy_note = (
+            f"Accuracy matters more than completeness. The plot must be right: "
+            f"use web search to check the synopsis and libretto where you can, "
+            f"and say plainly when you are unsure rather than inventing. Briefly "
+            f"gloss any theatre jargon the first time you use it.\n\n"
+        )
+
+        step_a = (
             f"Step A — Line attribution. Look up the score or libretto for this "
             f"number (web search if you can). Identify every character who sings "
             f"in it and label which lines belong to whom. Do not assume all "
             f"lyrics are sung by one character. If a line is shared, spoken, or "
             f"you cannot determine its speaker with confidence, flag it. Do not "
             f"guess — a wrong attribution corrupts everything that follows.\n\n"
-            f"{step_b}"
-            f"With those resolved, respond in plain prose under the numbered "
-            f"section headers below. No JSON, no code fences, no markdown tables "
-            f"in sections 1–9. "
-            f"Cite recordings as performer + year + medium (cast album, film, "
-            f"broadcast), and only cite ones you are confident are real. If a "
-            f"section does not apply, say so briefly rather than padding.\n\n"
-            f"A note on the music: you have the lyrics, not the score. For "
-            f"well-known repertoire you may know the melody, rhythm, and dynamics "
-            f"or be able to look them up — use that. But only assert a specific "
-            f"musical fact (a high note, a belt, a held forte, the tessitura, a "
-            f"ritardando) when you can actually verify it from the score or a "
-            f"recording. When you are inferring from the words alone, say so and "
-            f"phrase it conditionally. Emphasis and stress that follow from the "
-            f"meaning of the text are always fair game.\n\n"
-            f"1. Identification\n"
-            f"Name the work and confirm which character I am singing. Note an "
-            f"edition, key, or transposition only if it affects diction or which "
-            f"vowels land on which pitches. Keep this short — I do not need the "
-            f"composer's biography, premiere history, or production lineage. If "
-            f"you cannot identify the work with confidence, say so and stop "
-            f"rather than inventing context.\n\n"
-            f"2. Dramatic Context\n"
-            f"Briefly: my character's situation — who they are singing to or "
-            f"about, where this number sits in the show, and what immediately "
-            f"precedes and follows it. For art song or Lieder, give the poetic "
-            f"context instead: poet, source poem, and the speaker's situation.\n\n"
-            f"3. Emotional Arc\n"
-            f"Track how my character's inner state moves across the song. Mark "
-            f"every turning point by the lyric phrase where it occurs — not by "
-            f"bar number. Detailed enough that I can annotate a printed lyric "
-            f"sheet.\n\n"
-            f"4. Phrasing and Expression\n"
-            f"Working phrase by phrase, suggest where to stress, lean, grow, and "
-            f"recede; which words carry the line; and where to breathe so the "
-            f"phrasing serves the sense. Derive emphasis and stress from the "
-            f"meaning of the text (always available to you). Tie dynamics and "
-            f"shaping to the actual music only where you can verify it — "
-            f"otherwise mark the suggestion as conditional per the note above.\n\n"
-            f"5. Acting Direction\n"
-            f"Concrete, beat-by-beat acting notes for my lines only: where to "
-            f"lean in, where to pull back, what subtext shifts a line's reading, "
-            f"what stillness or gesture serves a moment. No generic notes like "
-            f"'feel it deeply'. Anchor every note to a specific word or phrase.\n\n"
-            f"CRITICAL CONSTRAINT on Section 5: every acting note must be "
-            f"compatible with what the music as written demands at that moment "
-            f"(subject to the note above on verifying musical facts). If the "
-            f"music calls for a belt, a sustained forte, or a climactic high "
-            f"note, do not direct me to pull back, go quiet, or make the moment "
-            f"smaller. Instead, show how my character's inner state justifies and "
-            f"fuels the vocal intensity the music requires. The acting serves the "
-            f"music; it does not override it.\n\n"
-            f"6. Singing Direction\n"
-            f"Research the specific vocal tradition for this role: how it has "
-            f"been cast and coached, what technique authoritative productions and "
-            f"recordings use, the expected vocal colour and weight. Name the "
-            f"technique explicitly (for example: mix-belt at the break, legato "
-            f"sostenuto through the phrase, speech-quality onset on the verse), "
-            f"glossing each. Address breath strategy on long phrases and any "
-            f"vowel modification the tessitura demands. Where I have marked "
-            f"sustained words or fixed pronunciations above, build your advice "
-            f"around those.\n\n"
-            f"7. Tradition and Interpretation\n"
-            f"Describe well-known recordings or stage interpretations and how "
-            f"they differ, naming specific singers and productions you are "
-            f"confident are real. Note where the standard reading has been "
-            f"challenged or where multiple defensible readings coexist.\n\n"
-            f"8. Pitfalls\n"
-            f"Common mistakes specific to this song and role — rushed phrases, "
-            f"misplaced emphases, vowel traps, clichéd dramatic choices. For each, "
-            f"name the word or line, say why the mistake happens, and what to do "
-            f"instead.\n\n"
-            f"9. Breath, Support, and Body\n"
-            f"Working from my breath plan above (or proposing one if I have none), "
-            f"give phrase-by-phrase breath strategy: where the full breaths and "
-            f"catch-breaths belong, which phrases are the air-budget risks, and "
-            f"how to pace support across each long phrase so the marked high notes "
-            f"and climaxes arrive funded rather than squeezed. Flag any of my "
-            f"breath placements that fight the musical line. Add body-level "
-            f"reminders only where they attach to a specific word or phrase — "
-            f"jaw release, tongue-root release, neck/shoulder reset before a "
-            f"climax — not generic relaxation advice. The same verification rule "
-            f"applies: tie claims to the score or recordings where you can, and "
-            f"mark inferences as conditional.\n\n"
-            f"After the nine prose sections, output exactly one import block — "
-            f"this only, nothing after it:\n"
+        )
+
+        principles = (
+            f"- Positive and active: what I am fighting for, never what I am "
+            f"avoiding. The negatives ('go away', 'I don't care', 'it's over') "
+            f"are already in the words; my job is the yes underneath them. If "
+            f"the lyric says I want to leave, ask why I am still here.\n"
+            f"- Say yes to involvement. Ask 'Where is the love?' and answer yes, "
+            f"counting love in all its forms: demanding, selfish, jealous, "
+            f"withheld, missing.\n"
+            f"- The biggest stakes that are honestly available, important to me "
+            f"now. No comfort goals ('to be understood', 'to be comforted'), no "
+            f"indifference, no 'they just happened to be there', no 'my "
+            f"character would never'.\n"
+            f"- Play the dream, not the ending. Even if things end badly for my "
+            f"character, in this song I am fighting to win and I believe the "
+            f"answer could be yes.\n"
+            f"- Prefer romance, imagination and risk over the sensible choice. "
+            f"Wanting to change the other person, competition and revenge are "
+            f"all strong motivations.\n"
+            f"- Be specific: name exactly what I want them to do or feel, and "
+            f"when.\n\n"
+        )
+
+        mt_note = (
+            f"Musical-theatre note: a song is often the climax of the scene "
+            f"before it, so carry the emotional line from the dialogue straight "
+            f"into the first lyric, arriving with the need already at full "
+            f"strength. Events in a song must be clear and pointed, not murky. "
+            f"Only state a musical fact (a belt, a held note, a key change) when "
+            f"you can verify it from the score or a recording; otherwise reason "
+            f"from the words and say so. Where the music peaks, the choice must "
+            f"fuel the peak, never pull it back.\n\n"
+        )
+
+        guideposts = (
+            f"1. Relationship — Where Is the Love?\n"
+            f"This is the centre of everything else. Start with who exactly I "
+            f"am singing to. If no one else is onstage, who specifically am I "
+            f"addressing (someone absent, someone imagined, the audience as a "
+            f"confidant), and what response do I need from them? Then take the "
+            f"fact of the relationship (mother, lover, rival) and refuse to "
+            f"stop there: how do I feel about this person now, at this exact "
+            f"point in the song, not when we met and not later in the show? "
+            f"Ask 'Where is the love in this song?' and push me to say yes, "
+            f"even where the lyrics say no. Love counts in all its forms: "
+            f"wanting it from them, being denied it, resenting that I need it, "
+            f"loving two people at once, love that is selfish or demanding. "
+            f"Make me say how this love differs from any other love I have in "
+            f"the story. Find the conflict inside the relationship layer by "
+            f"layer, adding each layer to the last instead of replacing it. "
+            f"Then turn to the other side: the coach asks what they want from "
+            f"me, how they see me and what they are fighting for, and uses "
+            f"those answers to deepen my own choice.\n\n"
+            f"2. What Am I Fighting For? (Conflict)\n"
+            f"The strongest positive goal. Push past the first, practical goal "
+            f"to the dream behind it ('Have you no dreams?'), and find who or "
+            f"what stands in the way.\n\n"
+            f"3. The Moment Before\n"
+            f"What happened in the last minute before I start singing, and how I "
+            f"need to feel as the introduction plays so that I start at full "
+            f"need instead of warming up into it. Specific to this moment, not "
+            f"my whole backstory.\n\n"
+            f"4. Humor\n"
+            f"Not jokes: where do I use humor to get through what is happening, "
+            f"to win them over, to deflect, or to make the weight bearable? Find "
+            f"it at particular lines, even in a serious song.\n\n"
+            f"5. Opposites\n"
+            f"Whatever my main drive is, its opposite is also true. Name the "
+            f"pairs (love and resentment, hope and fear, and so on) and where in "
+            f"the lyric each side surfaces. They should alternate at different "
+            f"moments: not blended into one note, and not in long blocks of "
+            f"one then the other.\n\n"
+            f"6. Discoveries\n"
+            f"What is new? Find the moments where I realise something for the "
+            f"first time, about them, about myself or about the situation, tied "
+            f"to specific lines. Nothing here is 'how it always is'.\n\n"
+            f"7. Communication and Competition\n"
+            f"What do I need them to feel, hear or agree to, and how do I check "
+            f"that it has landed? Where do I believe I am right and they are "
+            f"wrong, and exactly how do I want them to change?\n\n"
+            f"8. Importance\n"
+            f"What is at stake, raised as high as it can honestly go, and why it "
+            f"matters today rather than someday.\n\n"
+            f"9. Find the Events\n"
+            f"What changes over the course of the song? Mark the turning points, "
+            f"confrontations and the climax by lyric phrase. Treat each win or "
+            f"loss as a point scored that I register.\n\n"
+            f"10. Place\n"
+            f"Where am I, and how do I feel about this place? Whose place is it? "
+            f"What in it can I use: a window, a door, a view, a sound?\n\n"
+            f"11. Game Playing and Role Playing\n"
+            f"What game am I playing with them, and which roles do I shift "
+            f"through to win it (for example innocent, flirt, judge, wounded "
+            f"friend)? Where does each switch happen? What are the rules and the "
+            f"tone of this world, and how do I play my role in it well?\n\n"
+            f"12. Mystery and Secret\n"
+            f"What don't I know about them, or about myself, that I keep "
+            f"wondering about? What am I hiding, and do I want them to know I am "
+            f"hiding something?\n\n"
+        )
+
+        import_format = (
             f"NOTES-FOR-IMPORT\n"
             f"<<<\n"
             + '{"notes": [{"anchor": "<span copied verbatim from the lyrics>",'
               ' "note": "<short direction>"}]}\n'
             + f">>>\n\n"
+        )
+
+        import_rules_core = (
             f"Rules for the import block: anchor must be copied verbatim from "
             f"the lyrics between the <lyrics> markers above (same words, "
             f"capitalisation, punctuation) so it matches by exact text. Prefer "
             f"the shortest unambiguous span; extend with a neighbouring word if "
-            f"the span repeats elsewhere. note is one actionable direction under "
-            f"~15 words (e.g. 'go loud', 'darken the vowel', 'spit the "
-            f"consonant'). Draw 5\u201320 notes from sections 4, 5, and 9 only. "
-            f"This JSON block is the only place JSON is allowed in your response."
+            f"the span repeats elsewhere. note is one playable direction under "
+            f"~15 words, drawn from the 'My choice' and 'Where it lands' lines (e.g. 'moment before: she just "
+            f"said no', 'discovery: he isn't coming back', 'switch role: "
+            f"pleading to daring', 'opposite: resent him here', 'point scored: "
+            f"register it'). Put a moment-before note on the first lyric. "
+            f"Give 5\u201320 notes. This JSON block is the only place JSON "
+            f"is allowed in your response."
+        )
+
+        if interactive:
+            prompt = (
+                f"You are an acting coach running a live, one-to-one session "
+                f"the way Michael Shurtleff does in his book Audition: you ask "
+                f"the questions and I find the answers. I am a singer preparing "
+                f"the song below ({style_phrase}). Treat it as a scene: I am "
+                f"singing to someone, I need something from them, and something "
+                f"changes by the end. We are working through his twelve "
+                f"guideposts, but the choices have to come from me. That is the "
+                f"point of the session. I do not want vocal technique, breath or "
+                f"support advice, performance history or a list of mistakes to "
+                f"avoid.\n\n"
+                f"{accuracy_note}"
+                f"{intro_common}"
+                f"YOUR FIRST MESSAGE, and only your first message, does three "
+                f"things:\n"
+                f"1. Works out who sings what and states it in a few lines. "
+                f"{step_a}"
+                f"{step_b}"
+                f"2. Gives me the story so far: the plot up to the moment this "
+                f"song begins, keeping only what I need to play it (who my "
+                f"character is, what they want in the show, the relationships "
+                f"that matter in this number, what just happened). End with the "
+                f"situation at the downbeat, and do not tell me what happens "
+                f"after the song. For an art song, give the poem's speaker and "
+                f"situation instead.\n"
+                f"3. Asks your first question for Guidepost 1, then stops and "
+                f"waits for me.\n\n"
+                f"HOW TO RUN THE SESSION\n"
+                f"- Ask one question at a time (two at most), then wait. Keep "
+                f"your turns short: a sentence reacting to what I actually said, "
+                f"then the next question.\n"
+                f"- Never answer for me, and do not suggest what I might feel. "
+                f"If I type 'stuck', first give me a smaller, more concrete "
+                f"question about my situation. If I type 'stuck' again, offer "
+                f"two or three contrasting possibilities and let me pick one or "
+                f"build my own.\n"
+                f"- Push on what I say, using Shurtleff's moves. 'So?' after a "
+                f"bare fact. 'How much?' after a mild feeling. 'More.' while "
+                f"there is more conflict to find. 'Then why don't you leave?' "
+                f"when I want to get away. 'Why them and not someone else?' when "
+                f"my reason is circumstantial. 'Say yes, then tell me.' when I "
+                f"say no to love or involvement. 'What do you want for "
+                f"yourself?' when I am being selfless. 'Don't throw that away; "
+                f"add it.' when I swap an idea for a new one instead of "
+                f"layering.\n"
+                f"- When my answer is a negative choice, a comfort goal, "
+                f"indifference, a 'my character would never', or a judgment of "
+                f"the character from the outside, point that out in a line and "
+                f"ask again.\n"
+                f"- If I say 'he', 'she' or 'the character', ask me to say it "
+                f"again as 'I'.\n"
+                f"- Ask me where in the words it happens, and quote the lyric "
+                f"phrase back to me verbatim.\n"
+                f"- Do not settle for my first answer. Go several rounds deeper "
+                f"on every guidepost, and spend by far the longest on "
+                f"Guidepost 1, 'Where is the love?', which is the heart of the "
+                f"session.\n"
+                f"- Commitment matters more than being right. Do not correct my "
+                f"interpretive choices. Correct me only on a plot fact, in one "
+                f"line.\n"
+                f"- When a guidepost feels done, sum it up in my own words as "
+                f"'My choice:' and 'Where it lands:' (lyric phrases quoted "
+                f"verbatim), and ask whether that is right before moving on. I "
+                f"can also type 'next' to move on, 'skip' to skip a guidepost, "
+                f"or 'back' to return to an earlier one.\n\n"
+                f"THE GUIDEPOSTS, IN ORDER, AND WHAT EACH ONE IS AFTER\n"
+                f"{guideposts}"
+                f"{principles}"
+                f"{mt_note}"
+                f"FINISHING\n"
+                f"When we have finished Guidepost 12, or whenever I type "
+                f"'notes', give a short recap of every 'My choice' and 'Where "
+                f"it lands' we agreed, in my words. Then output exactly one "
+                f"import block, with nothing after it:\n"
+                f"{import_format}"
+                f"{import_rules_core} Build the notes only from choices I made "
+                f"in this session, keeping my wording where you can."
+            )
+            QApplication.clipboard().setText(prompt)
+            QMessageBox.information(
+                self, 'Coaching Session Prompt Copied',
+                "An interactive coaching prompt has been copied to your "
+                "clipboard.\n\n"
+                "Paste it into an AI chat and answer its questions one at a "
+                "time. Type 'stuck' for a nudge, 'next' / 'skip' / 'back' to "
+                "move around, and 'notes' when you're done. It will then give "
+                "you a NOTES-FOR-IMPORT block for Song → Import Coaching "
+                "Notes…")
+            return
+
+        prompt = (
+            f"You are an acting coach who works from Michael Shurtleff's twelve "
+            f"guideposts (from his book Audition). I am a singer preparing the "
+            f"song below ({style_phrase}), and I want help making strong acting "
+            f"choices for it. Treat the song as a scene: I am singing to "
+            f"someone, I need something from them, and something changes by the "
+            f"end. I do not want vocal technique, breath or support advice, "
+            f"performance history or famous recordings, or a list of mistakes "
+            f"to avoid.\n\n"
+            f"{accuracy_note}"
+            f"{intro_common}"
+            f"BEFORE YOU WRITE ANYTHING ELSE, do these two steps and state your "
+            f"findings at the top of your response:\n\n"
+            f"{step_a}"
+            f"{step_b}"
+            f"Then respond in plain prose under the headers below. No JSON, no "
+            f"code fences, no markdown tables.\n\n"
+            f"PART 1 — THE STORY SO FAR\n"
+            f"Name the work and my character in one line. Then tell the plot up "
+            f"to the moment this song begins, keeping only what I need to play "
+            f"it: who my character is, what they want in the show, the "
+            f"relationships that matter in this number, and what happened in "
+            f"the scene or scenes just before it. End with the situation at the "
+            f"downbeat: where I am, who is there (or whom I am imagining), and "
+            f"what was just said or done. Stop there and do not tell me what "
+            f"happens after this song. For an art song or concert piece, give "
+            f"the poem's speaker and their situation instead.\n\n"
+            f"PART 2 — THE TWELVE GUIDEPOSTS, AS COACHING SESSIONS\n"
+            f"Write each guidepost as a coaching exchange between you (COACH) "
+            f"and me (ME), the way Shurtleff questions an actor after a "
+            f"reading. Do not hand me a finished answer; show the choice "
+            f"getting deeper, round by round:\n"
+            f"- Open with the reading the words most invite, the one most "
+            f"singers would give, as ME's first answer. Say in one sentence "
+            f"what that would look like on stage (usually flat, cold, "
+            f"one-note or reluctant).\n"
+            f"- Then push, and keep pushing until the choice has real "
+            f"emotional depth. 'So?' after a bare fact. 'How much?' after a "
+            f"mild feeling. 'More.' while there is more conflict to find. "
+            f"'Then why don't you leave?' when I want to get away. 'Why them "
+            f"and not someone else?' when my reason is circumstantial. 'Say "
+            f"yes, then tell me.' when I say no to love or involvement. 'What "
+            f"do you want for yourself?' when I am being selfless. 'Don't "
+            f"throw that away; add it.' when a new idea replaces an earlier "
+            f"one instead of layering on top of it.\n"
+            f"- ME's answers get more specific, more personal and more "
+            f"contradictory with each push. They are always in the first "
+            f"person ('I need her to…', never 'he wants…' or 'the character "
+            f"feels…') and use concrete, imaginable details of my situation: "
+            f"what the other person did, what I dreamed would happen, what I "
+            f"stand to lose.\n"
+            f"- Keep the conflict alive instead of resolving it. Wanting to "
+            f"decide is more playable than deciding.\n"
+            f"- End every guidepost with two lines. 'My choice:' one or two "
+            f"sentences in the first person that hold both sides. 'Where it "
+            f"lands:' the lyric phrases, quoted verbatim, where this choice "
+            f"changes how I sing them, and how.\n"
+            f"Take as much room as this needs. Depth matters more than "
+            f"brevity: a guidepost that stops after one question and one "
+            f"answer has failed. Do not summarise the exchanges or reduce "
+            f"them to bullet points. Guidepost 1 is the heart of the session "
+            f"and should be the longest, at least eight rounds. Guideposts 2, "
+            f"3 and 5 get at least five rounds each, and every other "
+            f"guidepost at least three.\n\n"
+            f"What the coach is pushing toward (apply these, do not explain "
+            f"them back to me):\n"
+            f"{principles}"
+            f"{mt_note}"
+            f"{guideposts}"
+            f"After Part 2, output exactly one import block, with nothing "
+            f"after it:\n"
+            f"{import_format}"
+            f"{import_rules_core}"
         )
 
         QApplication.clipboard().setText(prompt)
         QMessageBox.information(
             self, 'Direction Prompt Copied',
-            "A research and direction prompt has been copied to your clipboard.\n\n"
-            "Paste it into an AI assistant. After the nine prose sections the "
-            "response will contain a NOTES-FOR-IMPORT block that you can bring "
-            "in via Song \u2192 Import Coaching Notes\u2026")
+            "An acting direction prompt has been copied to your clipboard.\n\n"
+            "Paste it into an AI assistant. After the story summary and the "
+            "twelve guidepost sections, the response will contain a "
+            "NOTES-FOR-IMPORT block that you can bring in via "
+            "Song → Import Coaching Notes…")
 
     def _on_import_coaching_notes(self):
         """Open paste dialog, parse NOTES-FOR-IMPORT block, append CoachingNotes."""
@@ -6371,30 +6573,20 @@ class MainWindow(QMainWindow):
             self._ipa_hints_action.setChecked(self._ipa_hints_enabled)
         # Restore Play-line-vowels gap; legacy 'seqHoldMs' (cap-based
         # presets from prior versions) is deliberately ignored.
-        saved_label = self.settings.value('seqPresetLabel', None)
-        # Backward-compat: old saves used seqGapMs; derive a label from it.
-        if saved_label is None:
-            saved_gap = self.settings.value('seqGapMs', None)
-            if saved_gap is not None:
-                try:
-                    g = int(saved_gap)
-                except (TypeError, ValueError):
-                    g = None
-                if g is not None:
-                    for label, gap, _rate, _variant in self._SEQ_SPEED_PRESETS:
-                        if int(gap) == g:
-                            saved_label = label
-                            break
-        if saved_label is not None:
-            for i, (label, gap, rate, variant) in enumerate(self._SEQ_SPEED_PRESETS):
-                if label == saved_label:
-                    self._seq_gap_ms = int(gap)
-                    self._seq_rate = float(rate)
-                    self._seq_variant = variant
-                    self._seq_speed_combo.blockSignals(True)
-                    self._seq_speed_combo.setCurrentIndex(i)
-                    self._seq_speed_combo.blockSignals(False)
-                    break
+        saved_gap = self.settings.value('seqGapMs', None)
+        if saved_gap is not None:
+            try:
+                g = int(saved_gap)
+            except (TypeError, ValueError):
+                g = None
+            if g is not None:
+                for i, (_, ms) in enumerate(self._SEQ_SPEED_PRESETS):
+                    if ms == g:
+                        self._seq_gap_ms = g
+                        self._seq_speed_combo.blockSignals(True)
+                        self._seq_speed_combo.setCurrentIndex(i)
+                        self._seq_speed_combo.blockSignals(False)
+                        break
 
 
     def _line_to_ipa_words(self, line_text: str,

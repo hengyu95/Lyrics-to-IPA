@@ -8,6 +8,7 @@
 			"args": [
                 "--onefile",
                 "--windowed",
+                "--icon", "icon.ico",
                 "--collect-data", "eng_to_ipa",
                 "--collect-submodules", "PyQt5.QtMultimedia",
                 "--add-data", "Audio:Audio", 
